@@ -867,7 +867,9 @@ stage_report() {
   done
 
   if (( DO_RESCUE )); then
-    ok "两条登录通道：主 ${MAIN_PORTS// /, }/tcp · 救援 ${RESCUE_PORT}/tcp"
+    local mp=${MAIN_PORTS% }
+    mp=${mp// /, }
+    ok "两条登录通道：主 ${mp}/tcp · 救援 ${RESCUE_PORT}/tcp"
   fi
 
   if (( CG_V2 )); then

@@ -1,5 +1,9 @@
 # ssh-reserve
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-systemd%20%7C%20cgroup%20v2-informational)](https://github.com/keweiya/ssh-reserve)
+[![Swap](https://img.shields.io/badge/swap-2G%20by%20default-green)](https://github.com/keweiya/ssh-reserve)
+
 **小服务器跑重活之后 SSH 连不上？一条命令给 sshd 预留 CPU / 内存，并加 2G swap 兜底。**
 
 针对 2C / 2G 这类小云主机：编译、构建、爬虫、压测把机器压满之后，`ssh` 不是密码错，而是 TCP 都慢、banner 都要等十几秒、或者直接 `Connection timed out`。
