@@ -9,7 +9,7 @@
 #    bash uninstall.sh --from DIR       # 指定备份目录（默认取最近一次）
 #
 #  行为：
-#    - 停用并删除 ssh-rescue.service
+#    - 停用并删除旧版遗留的 ssh-rescue.service（v1.1.0 起不再创建）
 #    - 用备份还原被覆盖的文件；没有备份的（本脚本新增的）直接删除
 #    - 安全校验通过后才 reload sshd，校验失败则拒绝 reload
 # =============================================================================
@@ -136,7 +136,7 @@ fi
 
 echo
 echo "卸载完成。当前状态："
-for u in ssh ssh-rescue earlyoom; do
+for u in ssh earlyoom; do
   printf "  %-12s %s\n" "$u" "$(systemctl is-active "$u" 2>/dev/null || echo inactive)"
 done
 swapon --show 2>/dev/null | sed 's/^/  /' || true

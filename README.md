@@ -61,7 +61,10 @@ CPU 排在最后：cgroup 权重足够解决，而且 sshd 本身几乎不吃 CP
       永不选 sshd / systemd，优先选编译工具链
 ```
 
-外加一条**救援通道**：第二个 sshd 实例监听独立端口（默认自动选，通常是 `2222`），同一套 host key 和 `authorized_keys`，主实例配置改错或被拖住时仍能进。
+> **v1.1.0 起移除了早期的"救援 sshd 实例"（第二个端口 2222）。**
+> 原因很直接：ssh 连不上是资源问题，多开一个端口解决不了，反而多一个爆破入口；
+> 而且它和主实例共用同一份 `sshd_config`，配置改错时一样起不来。
+> 旧版本装过的实例会在安装时自动清理。
 
 ---
 
@@ -103,8 +106,6 @@ sudo bash install.sh --no-swap          # 完全不动 swap
 | `--swap-size SIZE` | swap 大小，默认 `2G`（支持 `512M` / `2G` / `4G` / `1T`） |
 | `--swap-file PATH` | swap 文件位置，默认 `/swapfile` |
 | `--no-swap` | 不创建/修改 swap |
-| `--rescue-port PORT` | 救援 sshd 端口，默认自动选（避开主端口和已占用端口） |
-| `--no-rescue` | 不创建救援实例 |
 | `--no-earlyoom` | 不安装 earlyoom |
 | `--no-slice` | 不设置 slice 层 CPU/内存上限 |
 | `--no-kernel` | 不改内核参数 |
@@ -124,10 +125,9 @@ sudo bash install.sh --no-swap          # 完全不动 swap
 |---|---|---|
 | MemAvailable | 770 MiB | **60 MiB (3.14%)** |
 | ssh banner 延迟（主端口） | 19 ms | 35 / 58 / 91 ms |
-| ssh banner 延迟（救援端口） | 19 ms | 33 / 49 ms |
 | sshd `memory.events` `low/high/max/oom_kill` | 0 | **全部为 0** |
 | sshd `memory.current` | 9 MiB | 9 MiB（`memory.min=96M` 未被回收） |
-| 服务存活 | — | ssh / ssh-rescue / earlyoom **全部 active** |
+| 服务存活 | — | ssh / earlyoom **全部 active** |
 
 earlyoom 介入实测：
 
@@ -162,19 +162,18 @@ systemd-run --slice=heavy.slice --scope -t bash   # 等价写法
 
 超额部分由 `heavy.slice` 的 `CPUQuota` / `MemoryMax` 节流，不会传染给 sshd。
 
-### 两条登录通道
+### 登录
 
 ```bash
-ssh -p <主端口> root@host          # 主通道
-ssh -p 2222 root@host              # 救援通道
+ssh -p <主端口> root@host
 ```
 
-部署后**先确认救援端口能登录**，再依赖它。云厂商安全组需要自行放行这个端口。
+只有主 sshd 一个端口。真正的保险是云控制台的 VNC / 串口控制台，不是再开一个 sshd。
 
 ### 常用检查
 
 ```bash
-systemctl status ssh ssh-rescue earlyoom
+systemctl status ssh earlyoom
 systemctl show ssh -p MemoryCurrent -p MemoryMin -p MemoryMax -p CPUWeight
 grep -E "^(low|high|max|oom_kill)" /sys/fs/cgroup/system.slice/ssh.service/memory.events
 journalctl -u earlyoom -n 20 -o cat
@@ -187,7 +186,7 @@ journalctl -u earlyoom -n 20 -o cat
 **改完 ssh 配置后连不上**
 
 ```bash
-ssh -p 2222 root@host          # 走救援通道
+# 先通过云控制台 VNC / 串口进入
 /usr/sbin/sshd -t              # 验语法
 systemctl status ssh
 journalctl -u ssh -n 50

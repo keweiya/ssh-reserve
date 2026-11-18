@@ -30,16 +30,6 @@ MAIN_PORTS=$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | sort -un | tr '\
 MAIN_PORT=$(echo "$MAIN_PORTS" | awk '{print $1}')
 MAIN_PORT=${MAIN_PORT:-22}
 
-RESCUE_PORT=""
-if systemctl is-active --quiet ssh-rescue 2>/dev/null; then
-  RESCUE_PORT=$(systemctl show ssh-rescue -p ExecStart --value 2>/dev/null \
-    | grep -oE '\-p [0-9]+' | head -1 | awk '{print $2}')
-fi
-if [[ -z $RESCUE_PORT ]]; then
-  RESCUE_PORT=$(ss -tlnH 2>/dev/null | awk '{print $4}' | grep -oE '[0-9]+$' \
-    | sort -un | grep -vxE "$(echo "$MAIN_PORTS" | tr ' ' '|' | sed 's/|$//')" | head -1)
-fi
-
 probe() { # $1=port -> 毫秒 或 FAIL
   local s e
   s=$(date +%s%N)
@@ -67,9 +57,6 @@ echo "=================================================="
 printf "  MemAvailable : %s MiB (%s%%)\n" "$(mem_avail)" "$(mem_pct)"
 printf "  load         : %s\n" "$(cut -d' ' -f1-3 /proc/loadavg)"
 printf "  ssh :%-6s : %s ms\n" "$MAIN_PORT" "$(probe "$MAIN_PORT")"
-if [[ -n $RESCUE_PORT ]]; then
-  printf "  ssh :%-6s : %s ms\n" "$RESCUE_PORT" "$(probe "$RESCUE_PORT")"
-fi
 
 echo
 echo "=================================================="
@@ -99,14 +86,6 @@ for i in 1 2 3; do
     "$i" "$MAIN_PORT" "$latency" "$(mem_avail)" "$(mem_pct)"
   sleep 1
 done
-if [[ -n $RESCUE_PORT ]]; then
-  for i in 1 2; do
-    latency=$(probe "$RESCUE_PORT")
-    printf "  #%d ssh :%-6s : %s ms   MemAvailable %s MiB (%s%%)\n" \
-      "$i" "$RESCUE_PORT" "$latency" "$(mem_avail)" "$(mem_pct)"
-    sleep 1
-  done
-fi
 
 if systemctl is-active --quiet sr-mem 2>/dev/null; then
   echo "  (压测进程仍在，内存压力持续)"
@@ -142,7 +121,7 @@ echo
 echo "=================================================="
 echo " 服务存活"
 echo "=================================================="
-for u in ssh ssh-rescue earlyoom; do
+for u in ssh earlyoom; do
   printf "  %-12s %s\n" "$u" "$(systemctl is-active "$u" 2>/dev/null || echo n/a)"
 done
 if systemctl is-active --quiet earlyoom 2>/dev/null; then
@@ -157,6 +136,4 @@ echo "=================================================="
 cleanup
 sleep 2
 printf "  清理后 MemAvailable: %s MiB\n" "$(mem_avail)"
-for u in ssh ssh-rescue; do
-  printf "  %-12s %s\n" "$u" "$(systemctl is-active "$u" 2>/dev/null || echo n/a)"
-done
+printf "  %-12s %s\n" ssh "$(systemctl is-active ssh 2>/dev/null || echo n/a)"

@@ -26,7 +26,7 @@
 # =============================================================================
 set -Eeuo pipefail
 
-VERSION="1.0.2"
+VERSION="1.1.0"
 
 # 管道安装（curl | bash）时本地没有脚本文件，安装结束后要把它们落到这里，
 # 并提供 ssh-reserve 管理命令，否则提示里的 verify.sh / uninstall.sh 跑不通。
@@ -40,11 +40,9 @@ SWAP_PRI=10
 SWAP_SIZE="2G"          # 默认 2G swap
 SWAP_FILE="/swapfile"
 DO_SWAP=1
-DO_RESCUE=1
 DO_EARLYOOM=1
 DO_KERNEL=1
 DO_SLICE=1
-RESCUE_PORT=""
 DRY_RUN=0
 FORCE=0
 ACTION="install"
@@ -96,8 +94,6 @@ ssh-reserve — 小服务器 SSH 资源预留 + swap 一键部署
   --swap-size SIZE    swap 大小，默认 2G（支持 512M / 2G / 4G / 1T）
   --swap-file PATH    swap 文件位置，默认 /swapfile
   --no-swap           不创建/修改 swap
-  --rescue-port PORT  救援 sshd 端口，默认自动选（避开主端口）
-  --no-rescue         不创建救援 sshd 实例
   --no-earlyoom       不安装 earlyoom
   --no-slice          不设置 slice 层的 CPU/内存上限
   --no-kernel         不改内核参数
@@ -120,9 +116,11 @@ while [[ $# -gt 0 ]]; do
     --swap-file)     SWAP_FILE=${2:?--swap-file 需要参数}; shift 2 ;;
     --swap-file=*)   SWAP_FILE=${1#*=}; shift ;;
     --no-swap)       DO_SWAP=0; shift ;;
-    --rescue-port)   RESCUE_PORT=${2:?--rescue-port 需要参数}; shift 2 ;;
-    --rescue-port=*) RESCUE_PORT=${1#*=}; shift ;;
-    --no-rescue)     DO_RESCUE=0; shift ;;
+    # v1.1.0 起移除救援端口：问题在资源不足，多开端口解决不了。
+    # 保留解析，避免用户复制旧命令时报"未知参数"。
+    --rescue-port)   warn "v1.1.0 起已移除救援端口，忽略该参数"; shift 2 ;;
+    --rescue-port=*) warn "v1.1.0 起已移除救援端口，忽略该参数"; shift ;;
+    --no-rescue)     shift ;;
     --no-earlyoom)   DO_EARLYOOM=0; shift ;;
     --no-slice)      DO_SLICE=0; shift ;;
     --no-kernel)     DO_KERNEL=0; shift ;;
@@ -233,13 +231,6 @@ derive_params() {
   # CPU：2 核留约 1/4 给系统 => 150%；4 核 => 300%
   USER_CPU_QUOTA=$(( NPROC * 75 ))
   if (( USER_CPU_QUOTA < 50 )); then USER_CPU_QUOTA=50; fi
-
-  # 救援实例
-  RESCUE_MEM_MIN=$(pct "$MEM_MB" 3 32 96)
-  RESCUE_MEM_MAX=$(( RESCUE_MEM_MIN * 8 ))
-  if (( RESCUE_MEM_MAX > 512 )); then RESCUE_MEM_MAX=512; fi
-  RESCUE_MEM_LOW=$(( RESCUE_MEM_MIN * 3 / 2 ))
-  RESCUE_MEM_HIGH=$(( RESCUE_MEM_MAX * 3 / 4 ))
 
   # 内核
   MIN_FREE_KB=$(( MEM_MB * 5 * 1024 / 100 ))
@@ -441,6 +432,32 @@ stage_swap() {
 }
 
 # ----------------------------------------------------------------------------
+# 1.5 迁移：清理旧版本装过的救援 sshd 实例
+#   问题在资源不足，多开一个端口解决不了，反而多一个爆破入口。
+# ----------------------------------------------------------------------------
+stage_migrate() {
+  if [[ ! -f /etc/systemd/system/ssh-rescue.service ]]; then return 0; fi
+
+  step "清理旧版遗留的救援 sshd 实例"
+  if (( DRY_RUN )); then
+    printf '%s    $ systemctl disable --now ssh-rescue && rm -f /etc/systemd/system/ssh-rescue.service%s\n' \
+      "$C_D" "$C_0"
+    return 0
+  fi
+
+  backup_file /etc/systemd/system/ssh-rescue.service
+  systemctl disable --now ssh-rescue.service 2>/dev/null || true
+  rm -f /etc/systemd/system/ssh-rescue.service /run/sshd-rescue.pid
+  systemctl daemon-reload
+  ok "已移除 ssh-rescue.service，主 sshd 未受影响"
+
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "^Status: active"; then
+    warn "本机 ufw 里可能残留旧的放行规则，按需清理：ufw status numbered"
+  fi
+  warn "云安全组里的旧端口规则也可以一并删掉"
+}
+
+# ----------------------------------------------------------------------------
 # 2. sshd 的 cgroup 配额
 # ----------------------------------------------------------------------------
 stage_ssh_cgroup() {
@@ -587,178 +604,8 @@ HEAVYEOF
 # ----------------------------------------------------------------------------
 # 4. 救援 sshd 实例（必须在改主配置之前起来）
 # ----------------------------------------------------------------------------
-port_listening() {
-  ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"
-}
-
-port_owned_by_rescue() {
-  local port=$1 pid
-  pid=$(ss -tlnHp 2>/dev/null | awk -v pat="[:.]$port\$" '$4 ~ pat {print}' \
-        | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
-  if [[ -z $pid ]]; then return 1; fi
-  grep -q "ssh-rescue.service" "/proc/$pid/cgroup" 2>/dev/null
-}
-
-installed_rescue_port() {
-  local f=/etc/systemd/system/ssh-rescue.service
-  if [[ -f $f ]]; then
-    grep -oE '\-p [0-9]+' "$f" 2>/dev/null | head -1 | awk '{print $2}'
-  fi
-}
-
 # 当前正在跑的救援实例实际监听哪个端口。重装时用它来保持端口稳定，
 # 否则脚本会把自己的进程当成"端口被占用"，每重跑一次就往后挪一格。
-running_rescue_ports() {
-  local pid
-  pid=$(systemctl show ssh-rescue.service -p MainPID --value 2>/dev/null || echo 0)
-  if [[ ! $pid =~ ^[1-9][0-9]*$ ]]; then return 0; fi
-  ss -tlnHp 2>/dev/null | grep -F "pid=${pid}," | awk '{print $4}' \
-    | grep -oE '[0-9]+$' | sort -u
-}
-
-pick_rescue_port() {
-  local p m paid prev running
-
-  if [[ -n $RESCUE_PORT ]]; then
-    for p in $MAIN_PORTS; do
-      if [[ $p == "$RESCUE_PORT" ]]; then
-        die "救援端口 $RESCUE_PORT 与主端口冲突，换一个（--rescue-port）"
-      fi
-    done
-    printf '%s' "$RESCUE_PORT"
-    return 0
-  fi
-
-  # 1) 已有实例正在运行：直接沿用它的端口
-  running=$(running_rescue_ports | head -1)
-  if [[ -n $running ]]; then
-    paid=0
-    for m in $MAIN_PORTS; do
-      if [[ $m == "$running" ]]; then paid=1; fi
-    done
-    if (( ! paid )); then
-      printf '%s' "$running"
-      return 0
-    fi
-  fi
-
-  # 2) 上次装过但服务没在跑：沿用配置文件里的端口（前提是没被别的程序占走）
-  prev=$(installed_rescue_port)
-  if [[ -n $prev ]]; then
-    paid=0
-    for m in $MAIN_PORTS; do
-      if [[ $m == "$prev" ]]; then paid=1; fi
-    done
-    if (( ! paid )); then
-      if port_owned_by_rescue "$prev" || ! port_listening "$prev"; then
-        printf '%s' "$prev"
-        return 0
-      fi
-    fi
-  fi
-
-  # 3) 全新安装：挑一个没被占用的
-  for p in 2222 2223 2224 2225 2200; do
-    paid=0
-    for m in $MAIN_PORTS; do
-      if [[ $m == "$p" ]]; then paid=1; fi
-    done
-    if (( paid )); then continue; fi
-    if port_listening "$p"; then continue; fi
-    printf '%s' "$p"
-    return 0
-  done
-  die "找不到可用救援端口，用 --rescue-port 指定"
-}
-
-stage_rescue() {
-  if (( ! DO_RESCUE )); then
-    # --no-rescue 的语义是"确保没有救援实例"，所以已装过的要清掉，
-    # 不能只是本次跳过——否则用户以为关了，端口其实还在听。
-    if [[ -f /etc/systemd/system/ssh-rescue.service ]]; then
-      warn "检测到已安装的救援实例，按 --no-rescue 停用并移除"
-      if (( ! DRY_RUN )); then
-        systemctl disable --now ssh-rescue.service 2>/dev/null || true
-        rm -f /etc/systemd/system/ssh-rescue.service /run/sshd-rescue.pid
-        systemctl daemon-reload
-      fi
-    else
-      warn "按要求跳过救援实例（--no-rescue）"
-    fi
-    return 0
-  fi
-
-  step "救援 sshd 实例"
-  RESCUE_PORT=$(pick_rescue_port)
-  ok "救援端口: $RESCUE_PORT"
-
-  backup_file /etc/systemd/system/ssh-rescue.service
-  put /etc/systemd/system/ssh-rescue.service <<EOF
-# 由 ssh-reserve ${VERSION} 生成
-# 独立进程的第二个 sshd：主实例配置改错 / 重启空窗 / 被拖住时仍能进。
-# 同一套 host key 与 authorized_keys，只是端口和配额独立。
-[Unit]
-Description=OpenSSH rescue instance (port ${RESCUE_PORT})
-Documentation=man:sshd(8)
-After=network.target
-StartLimitIntervalSec=0
-StartLimitBurst=0
-
-[Service]
-Type=simple
-ExecStartPre=/bin/mkdir -p /run/sshd
-ExecStartPre=-${SSHD_BIN} -t -p ${RESCUE_PORT}
-ExecStart=${SSHD_BIN} -D -p ${RESCUE_PORT} -o PidFile=/run/sshd-rescue.pid
-ExecReload=${SSHD_BIN} -t -p ${RESCUE_PORT}
-ExecReload=/bin/kill -HUP \$MAINPID
-KillMode=process
-Restart=always
-RestartSec=2s
-CPUWeight=10000
-Nice=-10
-IOWeight=10000
-IOSchedulingClass=best-effort
-IOSchedulingPriority=0
-MemoryMin=${RESCUE_MEM_MIN}M
-MemoryLow=${RESCUE_MEM_LOW}M
-MemoryHigh=${RESCUE_MEM_HIGH}M
-MemoryMax=${RESCUE_MEM_MAX}M
-MemorySwapMax=0
-OOMScoreAdjust=-1000
-OOMPolicy=continue
-TasksMax=4096
-LimitNOFILE=65535
-LimitCORE=0
-CPUAccounting=yes
-MemoryAccounting=yes
-IOAccounting=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  if (( ! DRY_RUN )); then
-    if ! "$SSHD_BIN" -t -p "$RESCUE_PORT"; then die "救援实例配置校验失败"; fi
-    systemctl daemon-reload
-    systemctl enable ssh-rescue.service >/dev/null 2>&1 || true
-    # 必须 restart，不能用 enable --now：服务已经在跑时 enable --now 不会
-    # 重新读取配置，会出现"配置文件写新端口、进程还挂在旧端口"的错位。
-    systemctl restart ssh-rescue.service 2>/dev/null || true
-    sleep 2
-    if systemctl is-active --quiet ssh-rescue && port_listening "$RESCUE_PORT"; then
-      ok "救援实例已启动并监听 :${RESCUE_PORT}"
-    else
-      warn "救援实例未起来，最近日志："
-      journalctl -u ssh-rescue -n 20 --no-pager 2>/dev/null | sed 's/^/    /'
-      if ! port_listening "$RESCUE_PORT"; then
-        warn "端口 ${RESCUE_PORT} 当前没有监听者；若上面日志有 Address already in use，说明被别的程序占用"
-        ss -tlnHp 2>/dev/null | awk -v pat="[:.]${RESCUE_PORT}\$" '$4 ~ pat {print "    占用者: "$0}'
-      fi
-      die "可换端口重试：--rescue-port 2224。主 sshd 未被改动，现有连接不受影响"
-    fi
-  fi
-}
-
 # ----------------------------------------------------------------------------
 # 5. sshd 抗连接风暴
 # ----------------------------------------------------------------------------
@@ -819,7 +666,7 @@ stage_apply() {
   else
     warn "reload 失败，尝试 restart"
     if ! systemctl restart ssh; then
-      die "ssh 重启失败。用 :${RESCUE_PORT} 登录后排查: journalctl -u ssh -n 50"
+      die "ssh 重启失败。用云控制台 VNC/串口登录后排查: journalctl -u ssh -n 50"
     fi
     ok "ssh 已 restart"
   fi
@@ -927,26 +774,6 @@ EOF
 # ----------------------------------------------------------------------------
 # 10. 防火墙
 # ----------------------------------------------------------------------------
-stage_firewall() {
-  if (( ! DO_RESCUE )); then return 0; fi
-  step "防火墙放行救援端口"
-
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "^Status: active"; then
-    if run ufw allow "${RESCUE_PORT}/tcp" >/dev/null; then
-      ok "ufw 放行 ${RESCUE_PORT}/tcp"
-    fi
-  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -q running; then
-    run firewall-cmd --permanent --add-port="${RESCUE_PORT}/tcp" >/dev/null
-    run firewall-cmd --reload >/dev/null
-    ok "firewalld 放行 ${RESCUE_PORT}/tcp"
-  elif command -v iptables >/dev/null 2>&1 && iptables -S 2>/dev/null | grep -q "^-P INPUT DROP"; then
-    warn "iptables 默认 DROP 但无 ufw/firewalld，请手动放行 ${RESCUE_PORT}/tcp"
-  else
-    ok "未检测到本机防火墙，跳过"
-  fi
-  warn "云厂商安全组需自行放行 ${RESCUE_PORT}/tcp"
-}
-
 # ----------------------------------------------------------------------------
 # 11. 把管理脚本落到本地（管道安装时尤其需要）
 # ----------------------------------------------------------------------------
@@ -996,7 +823,7 @@ case $cmd in
   uninstall) exec bash "$D/uninstall.sh" "$@" ;;
   verify)    exec bash "$D/verify.sh" "$@" ;;
   status)
-    for u in ssh ssh-rescue earlyoom; do
+    for u in ssh earlyoom; do
       printf '  %-12s %s\n' "$u" "$(systemctl is-active "$u" 2>/dev/null || echo n/a)"
     done
     swapon --show 2>/dev/null || true
@@ -1028,7 +855,7 @@ stage_report() {
   if (( DRY_RUN )); then warn "dry-run 结束，没有改动任何文件"; return 0; fi
 
   local unit st cg
-  for unit in ssh ssh-rescue earlyoom; do
+  for unit in ssh earlyoom; do
     st=$(systemctl is-active "$unit" 2>/dev/null || true)
     if [[ $st == active ]]; then
       ok "$unit: active"
@@ -1037,11 +864,9 @@ stage_report() {
     fi
   done
 
-  if (( DO_RESCUE )); then
-    local mp=${MAIN_PORTS% }
-    mp=${mp// /, }
-    ok "两条登录通道：主 ${mp}/tcp · 救援 ${RESCUE_PORT}/tcp"
-  fi
+  local mp=${MAIN_PORTS% }
+  mp=${mp// /, }
+  ok "sshd 监听端口：${mp}/tcp"
 
   if (( CG_V2 )); then
     cg=/sys/fs/cgroup/system.slice/ssh.service
@@ -1069,7 +894,7 @@ main() {
   stage_preflight
   derive_params
   stage_swap
-  stage_rescue
+  stage_migrate
   stage_ssh_cgroup
   stage_slice
   stage_sshd_harden
@@ -1077,7 +902,6 @@ main() {
   stage_kernel
   stage_journald
   stage_earlyoom
-  stage_firewall
   stage_persist
   stage_report
   printf '\n%s完成。%s\n' "$C_G" "$C_0"
