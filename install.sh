@@ -26,7 +26,7 @@
 # =============================================================================
 set -Eeuo pipefail
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 
 # 管道安装（curl | bash）时本地没有脚本文件，安装结束后要把它们落到这里，
 # 并提供 ssh-reserve 管理命令，否则提示里的 verify.sh / uninstall.sh 跑不通。
@@ -37,7 +37,7 @@ SWAP_PRI=10
 # ----------------------------------------------------------------------------
 # 默认参数
 # ----------------------------------------------------------------------------
-SWAP_SIZE="2G"          # 默认 2G swap
+SWAP_SIZE="auto"        # auto = clamp(RAM, 2G, 4G)；也可显式给 2G / 4G / 512M
 SWAP_FILE="/swapfile"
 DO_SWAP=1
 DO_EARLYOOM=1
@@ -91,7 +91,8 @@ usage() {
   cat <<'USAGE'
 ssh-reserve — 小服务器 SSH 资源预留 + swap 一键部署
 
-  --swap-size SIZE    swap 大小，默认 2G（支持 512M / 2G / 4G / 1T）
+  --swap-size SIZE    swap 大小，默认 auto（clamp(内存, 2G, 4G)）
+                      也可显式指定：512M / 2G / 4G / 1T
   --swap-file PATH    swap 文件位置，默认 /swapfile
   --no-swap           不创建/修改 swap
   --no-earlyoom       不安装 earlyoom
@@ -259,6 +260,21 @@ derive_params() {
 # ----------------------------------------------------------------------------
 # 1. swap
 # ----------------------------------------------------------------------------
+# auto: clamp(RAM, 2G, 4G)
+# 小机器给足缓冲；4G 以上封顶 4G —— swap 是冷页回收区，不是内存扩展，
+# 给太多会拖长抖动窗口、推迟 earlyoom 介入，反而让 ssh 更卡。
+resolve_swap_mb() {
+  local s=$1
+  if [[ $s != auto ]]; then
+    swap_mb_from_size "$s"
+    return 0
+  fi
+  local mb=${MEM_MB:-2048}
+  if (( mb < 2048 )); then mb=2048; fi
+  if (( mb > 4096 )); then mb=4096; fi
+  printf '%d' "$mb"
+}
+
 swap_mb_from_size() {
   local s=${1^^}
   case $s in
@@ -312,10 +328,14 @@ add_fstab_swap() {
 stage_swap() {
   if (( ! DO_SWAP )); then warn "按要求跳过 swap（--no-swap）"; return 0; fi
 
-  step "swap（目标 ${SWAP_SIZE}，文件 ${SWAP_FILE}）"
+  if [[ $SWAP_SIZE == auto ]]; then
+    step "swap（自动：内存 ${MEM_MB}M → clamp(2G,4G)，文件 ${SWAP_FILE}）"
+  else
+    step "swap（目标 ${SWAP_SIZE}，文件 ${SWAP_FILE}）"
+  fi
 
   local want_mb cur_mb avail_kb fs need_kb now_mb alloc_kb decl_kb
-  want_mb=$(swap_mb_from_size "$SWAP_SIZE")
+  want_mb=$(resolve_swap_mb "$SWAP_SIZE")
   if (( want_mb < 64 )); then die "swap 至少 64M"; fi
 
   cur_mb=$(active_swap_mb "$SWAP_FILE")

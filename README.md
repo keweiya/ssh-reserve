@@ -103,7 +103,7 @@ sudo bash install.sh --no-swap          # 完全不动 swap
 
 | 参数 | 说明 |
 |---|---|
-| `--swap-size SIZE` | swap 大小，默认 `2G`（支持 `512M` / `2G` / `4G` / `1T`） |
+| `--swap-size SIZE` | swap 大小，默认 `auto` = `clamp(内存, 2G, 4G)`；也可显式 `512M` / `2G` / `4G` / `1T` |
 | `--swap-file PATH` | swap 文件位置，默认 `/swapfile` |
 | `--no-swap` | 不创建/修改 swap |
 | `--no-earlyoom` | 不安装 earlyoom |
@@ -246,6 +246,47 @@ sudo bash uninstall.sh --keep-earlyoom  # 保留 earlyoom
 | 1 GB | 64M | 384M | 75% |
 | 2 GB | 96M | 634M | 150%（2 核） |
 | 4 GB | 128M | 1351M | 300%（4 核） |
+
+---
+
+## swap 怎么定大小
+
+默认 `auto`，规则是 `clamp(RAM, 2G, 4G)`：
+
+| 内存 | auto 结果 | 说明 |
+|---|---|---|
+| ≤ 2 GB | **2 GB** | 小机器给足缓冲 |
+| 4 GB | **4 GB** | = RAM |
+| ≥ 8 GB | **4 GB** | 封顶 |
+
+### 为什么不是传统教科书的 2×
+
+- **swap 是回收区，不是内存扩展。** 它的作用是给内存压力一个缓冲，
+  让内核回收和 earlyoom 有时间反应，而不是让进程无限跑下去。
+- **给太多会拖长抖动窗口。** 1.9 GB 内存配 4 GB swap，一旦工作集超过 RAM，
+  系统会持续在磁盘和内存之间换页，`wa` 飙高，**ssh 反而更卡** —— 正是要避免的情况。
+- **大 swap 还会推迟 earlyoom 介入**，等于削弱了保护。
+- 容量从来不是瓶颈，带宽才是。nvme 上 2 GB 和 4 GB 的随机读写性能一样。
+
+实测这台 1.9 GB 机器（做过多次内存压测）：
+
+```
+累计 swap out : 18160 MiB
+累计 swap in  : 15557 MiB
+当前占用      : 23.5 MiB
+实时 si/so    : 0 / 0
+```
+
+swap 确实在压力时吸收了大量匿名页，但 2 GB 的容量足够周转。
+
+### 什么情况该显式调
+
+| 场景 | 做法 |
+|---|---|
+| 有休眠需求（笔记本 / `systemctl hibernate`） | `--swap-size` 设为 **≥ 内存** |
+| Java 大堆 / Elasticsearch / 数据库 | 反而建议降 `swappiness` 或关 swap，**不是加大** |
+| 容器宿主机 | 往往禁用 swap，避免破坏 cgroup 内存隔离 |
+| 内存 ≥ 8 GB 但 swap 只有 512 MB | `--swap-size 4G`，让冷页有地方去 |
 
 ---
 
