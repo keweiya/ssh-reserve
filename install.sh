@@ -26,7 +26,7 @@
 # =============================================================================
 set -Eeuo pipefail
 
-VERSION="1.0.1"
+VERSION="1.0.2"
 
 # 管道安装（curl | bash）时本地没有脚本文件，安装结束后要把它们落到这里，
 # 并提供 ssh-reserve 管理命令，否则提示里的 verify.sh / uninstall.sh 跑不通。
@@ -672,7 +672,21 @@ pick_rescue_port() {
 }
 
 stage_rescue() {
-  if (( ! DO_RESCUE )); then warn "按要求跳过救援实例（--no-rescue）"; return 0; fi
+  if (( ! DO_RESCUE )); then
+    # --no-rescue 的语义是"确保没有救援实例"，所以已装过的要清掉，
+    # 不能只是本次跳过——否则用户以为关了，端口其实还在听。
+    if [[ -f /etc/systemd/system/ssh-rescue.service ]]; then
+      warn "检测到已安装的救援实例，按 --no-rescue 停用并移除"
+      if (( ! DRY_RUN )); then
+        systemctl disable --now ssh-rescue.service 2>/dev/null || true
+        rm -f /etc/systemd/system/ssh-rescue.service /run/sshd-rescue.pid
+        systemctl daemon-reload
+      fi
+    else
+      warn "按要求跳过救援实例（--no-rescue）"
+    fi
+    return 0
+  fi
 
   step "救援 sshd 实例"
   RESCUE_PORT=$(pick_rescue_port)
