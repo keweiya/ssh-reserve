@@ -230,6 +230,56 @@ sudo bash uninstall.sh --keep-earlyoom  # 保留 earlyoom
 
 ---
 
+## 容器 / 小硬盘环境（LXC、Docker、K8s pod）
+
+这些环境里 swap 通常开不起来，原因不止一个：
+
+- 容器没有 `CAP_SYS_ADMIN`，`swapon` 直接失败
+- 宿主机把 `memory.swap.max` 设成 0 或没下放 swap 控制器
+- 根文件系统是只读层或镜像层，写不了几 GB 的文件
+
+**脚本会自动识别并跳过 swap**，只做 ssh 资源预留，不中断：
+
+```
+ok 容器环境: lxc（swap 将默认跳过，cgroup 设置可能受宿主限制）
+!! 容器环境（lxc）：swap 通常不可用，跳过
+!! 确需尝试请显式指定：--swap-size 2G
+```
+
+硬盘不够时同样优雅降级：
+
+```
+==> swap（自动：内存 1922M → clamp(2G,4G)，文件 /swapfile）
+  ok 文件系统: ext4
+!! 磁盘不足：需要 2304M，剩余 191M
+!! 跳过 swap，继续做 ssh 资源预留 —— swap 只是缓冲，预留不依赖它
+```
+
+只有**你显式指定 `--swap-size` 且磁盘放不下**时才会报错退出，因为那属于明确要求但做不到。
+
+### 手动关闭
+
+```bash
+curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@v1.2.0/install.sh | sudo bash --no-swap
+```
+
+`--no-swap` 只表示"本次不创建/修改 swap"，**不会**删除已有的 swap 文件或 `/etc/fstab` 条目。
+
+### 容器里 cgroup 可能设不上
+
+容器内 `/sys/fs/cgroup` 常是只读挂载，`memory.min` / `CPUWeight` 写不进去。
+脚本会读回实际值来判断，而不是写进去就当成功：
+
+```
+!! sshd cgroup: memory.min 未生效（容器内 cgroup 多为只读，属预期）
+!!   仍然生效的保护：Nice=-10 / OOMScoreAdjust=-1000 / IO 优先级 / Restart=always
+```
+
+这种情况下降级后的保护里，`oom_score_adj=-1000` 和 `nice=-10` 是**进程属性**，
+不受 cgroup 只读限制，对"ssh 连不上"依然有效；少掉的是内存侧的硬保留。
+
+---
+
 ## 兼容性
 
 | 项目 | 要求 |

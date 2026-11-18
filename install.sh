@@ -26,7 +26,7 @@
 # =============================================================================
 set -Eeuo pipefail
 
-VERSION="1.1.1"
+VERSION="1.2.0"
 
 # 管道安装（curl | bash）时本地没有脚本文件，安装结束后要把它们落到这里，
 # 并提供 ssh-reserve 管理命令，否则提示里的 verify.sh / uninstall.sh 跑不通。
@@ -38,6 +38,8 @@ SWAP_PRI=10
 # 默认参数
 # ----------------------------------------------------------------------------
 SWAP_SIZE="auto"        # auto = clamp(RAM, 2G, 4G)；也可显式给 2G / 4G / 512M
+SWAP_EXPLICIT=0         # 用户是否显式指定过 --swap-size
+CONTAINER=""            # 容器类型，空 = 非容器
 SWAP_FILE="/swapfile"
 DO_SWAP=1
 DO_EARLYOOM=1
@@ -112,8 +114,8 @@ USAGE
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --swap-size)     SWAP_SIZE=${2:?--swap-size 需要参数}; shift 2 ;;
-    --swap-size=*)   SWAP_SIZE=${1#*=}; shift ;;
+    --swap-size)     SWAP_SIZE=${2:?--swap-size 需要参数}; SWAP_EXPLICIT=1; shift 2 ;;
+    --swap-size=*)   SWAP_SIZE=${1#*=}; SWAP_EXPLICIT=1; shift ;;
     --swap-file)     SWAP_FILE=${2:?--swap-file 需要参数}; shift 2 ;;
     --swap-file=*)   SWAP_FILE=${1#*=}; shift ;;
     --no-swap)       DO_SWAP=0; shift ;;
@@ -181,6 +183,22 @@ stage_preflight() {
   BACKUP_DIR="/var/backups/ssh-reserve/$(date +%Y%m%d-%H%M%S)"
   if (( DRY_RUN )); then BACKUP_DIR="/tmp/ssh-reserve-dryrun"; fi
   ok "备份目录: $BACKUP_DIR"
+
+  # 容器环境：LXC / Docker / Podman / K8s pod 里 swap 通常开不起来，
+  # cgroup 资源限制也常常是只读的，需要提前识别并降级。
+  CONTAINER=""
+  if command -v systemd-detect-virt >/dev/null 2>&1; then
+    CONTAINER=$(systemd-detect-virt --container 2>/dev/null || true)
+  fi
+  if [[ $CONTAINER == none ]]; then CONTAINER=""; fi
+  if [[ -z $CONTAINER && -f /.dockerenv ]]; then CONTAINER="docker"; fi
+  if [[ -z $CONTAINER && -f /run/.containerenv ]]; then CONTAINER="podman"; fi
+  if [[ -z $CONTAINER ]] && grep -qaE '(lxc|docker|kubepods|containerd)' /proc/1/cgroup 2>/dev/null; then
+    CONTAINER="container"
+  fi
+  if [[ -n $CONTAINER ]]; then
+    ok "容器环境: $CONTAINER（swap 将默认跳过，cgroup 设置可能受宿主限制）"
+  fi
 
   # 判断是不是在用管道跑：BASH_SOURCE 为 bash 或 /dev/fd/63 这类不可读路径
   SELF_PATH="${BASH_SOURCE[0]:-}"
@@ -328,6 +346,14 @@ add_fstab_swap() {
 stage_swap() {
   if (( ! DO_SWAP )); then warn "按要求跳过 swap（--no-swap）"; return 0; fi
 
+  # 容器里 swap 基本开不起来（没有 CAP_SYS_ADMIN，或 cgroup memory.swap.max=0），
+  # 默认直接跳过，不浪费时间也不吓人；确需尝试的用户显式给 --swap-size 即可。
+  if (( ! SWAP_EXPLICIT )) && [[ -n ${CONTAINER:-} ]]; then
+    warn "容器环境（${CONTAINER}）：swap 通常不可用，跳过"
+    warn "确需尝试请显式指定：--swap-size 2G"
+    return 0
+  fi
+
   if [[ $SWAP_SIZE == auto ]]; then
     step "swap（自动：内存 ${MEM_MB}M → clamp(2G,4G)，文件 ${SWAP_FILE}）"
   else
@@ -384,7 +410,12 @@ stage_swap() {
   need_kb=$(( want_mb * 1024 + 262144 ))
   avail_kb=$(df -Pk "$(dirname "$SWAP_FILE")" | awk 'NR==2{print $4}')
   if (( avail_kb < need_kb )); then
-    die "磁盘不足：需要 $(( need_kb / 1024 ))M，$(dirname "$SWAP_FILE") 剩余 $(( avail_kb / 1024 ))M"
+    if (( SWAP_EXPLICIT )); then
+      die "磁盘不足：需要 $(( need_kb / 1024 ))M，$(dirname "$SWAP_FILE") 剩余 $(( avail_kb / 1024 ))M"
+    fi
+    warn "磁盘不足：需要 $(( need_kb / 1024 ))M，剩余 $(( avail_kb / 1024 ))M"
+    warn "跳过 swap，继续做 ssh 资源预留 —— swap 只是缓冲，预留不依赖它"
+    return 0
   fi
   ok "磁盘剩余 $(( avail_kb / 1024 ))M，足够"
 
@@ -890,11 +921,19 @@ stage_report() {
 
   if (( CG_V2 )); then
     cg=/sys/fs/cgroup/system.slice/ssh.service
-    if [[ -f $cg/memory.min ]]; then
-      ok "sshd cgroup: min=$(( $(cat $cg/memory.min) / 1048576 ))M max=$(( $(cat $cg/memory.max) / 1048576 ))M cpu.weight=$(cat $cg/cpu.weight) swap.max=$(cat $cg/memory.swap.max)"
+    local v
+    v=$(cat "$cg/memory.min" 2>/dev/null || echo 0)
+    if (( v > 0 )); then
+      ok "sshd cgroup: min=$(( v / 1048576 ))M max=$(( $(cat "$cg/memory.max" 2>/dev/null || echo 0) / 1048576 ))M cpu.weight=$(cat "$cg/cpu.weight" 2>/dev/null || echo '?') swap.max=$(cat "$cg/memory.swap.max" 2>/dev/null || echo '?')"
+    else
+      warn "sshd cgroup: memory.min 未生效（容器内 cgroup 多为只读，属预期）"
+      warn "  仍然生效的保护：Nice=-10 / OOMScoreAdjust=-1000 / IO 优先级 / Restart=always"
     fi
-    if [[ -f /sys/fs/cgroup/system.slice/memory.min ]]; then
-      ok "system.slice: min=$(( $(cat /sys/fs/cgroup/system.slice/memory.min) / 1048576 ))M"
+    v=$(cat /sys/fs/cgroup/system.slice/memory.min 2>/dev/null || echo 0)
+    if (( v > 0 )); then
+      ok "system.slice: min=$(( v / 1048576 ))M"
+    else
+      warn "system.slice: MemoryMin 未生效（宿主未下放 memory 控制器）"
     fi
   fi
 
