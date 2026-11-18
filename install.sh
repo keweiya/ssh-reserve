@@ -20,17 +20,17 @@
 #    bash install.sh --help
 #
 #  一行安装：
-#    curl -fsSL https://raw.githubusercontent.com/keweiya/ssh-reserve/main/install.sh | sudo bash
+#    curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@main/install.sh | sudo bash
 #
 #  版本: 1.0.0    许可: MIT
 # =============================================================================
 set -Eeuo pipefail
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 
 # 管道安装（curl | bash）时本地没有脚本文件，安装结束后要把它们落到这里，
 # 并提供 ssh-reserve 管理命令，否则提示里的 verify.sh / uninstall.sh 跑不通。
-RAW_BASE="https://raw.githubusercontent.com/keweiya/ssh-reserve/main"
+RAW_BASE="https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@main"
 SSH_RESERVE_LIB=${SSH_RESERVE_LIB:-/usr/local/lib/ssh-reserve}
 SWAP_PRI=10
 
@@ -139,7 +139,7 @@ if [[ $ACTION == uninstall ]]; then
   if [[ -f $SELF_DIR/uninstall.sh ]]; then
     exec bash "$SELF_DIR/uninstall.sh"
   fi
-  die "找不到 uninstall.sh；单独下载：https://raw.githubusercontent.com/keweiya/ssh-reserve/main/uninstall.sh"
+  die "找不到 uninstall.sh；单独下载：https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@main/uninstall.sh"
 fi
 
 # ----------------------------------------------------------------------------
@@ -587,8 +587,38 @@ HEAVYEOF
 # ----------------------------------------------------------------------------
 # 4. 救援 sshd 实例（必须在改主配置之前起来）
 # ----------------------------------------------------------------------------
+port_listening() {
+  ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"
+}
+
+port_owned_by_rescue() {
+  local port=$1 pid
+  pid=$(ss -tlnHp 2>/dev/null | awk -v pat="[:.]$port\$" '$4 ~ pat {print}' \
+        | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
+  if [[ -z $pid ]]; then return 1; fi
+  grep -q "ssh-rescue.service" "/proc/$pid/cgroup" 2>/dev/null
+}
+
+installed_rescue_port() {
+  local f=/etc/systemd/system/ssh-rescue.service
+  if [[ -f $f ]]; then
+    grep -oE '\-p [0-9]+' "$f" 2>/dev/null | head -1 | awk '{print $2}'
+  fi
+}
+
+# 当前正在跑的救援实例实际监听哪个端口。重装时用它来保持端口稳定，
+# 否则脚本会把自己的进程当成"端口被占用"，每重跑一次就往后挪一格。
+running_rescue_ports() {
+  local pid
+  pid=$(systemctl show ssh-rescue.service -p MainPID --value 2>/dev/null || echo 0)
+  if [[ ! $pid =~ ^[1-9][0-9]*$ ]]; then return 0; fi
+  ss -tlnHp 2>/dev/null | grep -F "pid=${pid}," | awk '{print $4}' \
+    | grep -oE '[0-9]+$' | sort -u
+}
+
 pick_rescue_port() {
-  local p m paid busy
+  local p m paid prev running
+
   if [[ -n $RESCUE_PORT ]]; then
     for p in $MAIN_PORTS; do
       if [[ $p == "$RESCUE_PORT" ]]; then
@@ -598,15 +628,43 @@ pick_rescue_port() {
     printf '%s' "$RESCUE_PORT"
     return 0
   fi
+
+  # 1) 已有实例正在运行：直接沿用它的端口
+  running=$(running_rescue_ports | head -1)
+  if [[ -n $running ]]; then
+    paid=0
+    for m in $MAIN_PORTS; do
+      if [[ $m == "$running" ]]; then paid=1; fi
+    done
+    if (( ! paid )); then
+      printf '%s' "$running"
+      return 0
+    fi
+  fi
+
+  # 2) 上次装过但服务没在跑：沿用配置文件里的端口（前提是没被别的程序占走）
+  prev=$(installed_rescue_port)
+  if [[ -n $prev ]]; then
+    paid=0
+    for m in $MAIN_PORTS; do
+      if [[ $m == "$prev" ]]; then paid=1; fi
+    done
+    if (( ! paid )); then
+      if port_owned_by_rescue "$prev" || ! port_listening "$prev"; then
+        printf '%s' "$prev"
+        return 0
+      fi
+    fi
+  fi
+
+  # 3) 全新安装：挑一个没被占用的
   for p in 2222 2223 2224 2225 2200; do
     paid=0
     for m in $MAIN_PORTS; do
       if [[ $m == "$p" ]]; then paid=1; fi
     done
     if (( paid )); then continue; fi
-    busy=0
-    if ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}\$"; then busy=1; fi
-    if (( busy )); then continue; fi
+    if port_listening "$p"; then continue; fi
     printf '%s' "$p"
     return 0
   done
@@ -668,13 +726,21 @@ EOF
   if (( ! DRY_RUN )); then
     if ! "$SSHD_BIN" -t -p "$RESCUE_PORT"; then die "救援实例配置校验失败"; fi
     systemctl daemon-reload
-    systemctl enable --now ssh-rescue.service
-    sleep 1
-    if systemctl is-active --quiet ssh-rescue \
-       && ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${RESCUE_PORT}\$"; then
+    systemctl enable ssh-rescue.service >/dev/null 2>&1 || true
+    # 必须 restart，不能用 enable --now：服务已经在跑时 enable --now 不会
+    # 重新读取配置，会出现"配置文件写新端口、进程还挂在旧端口"的错位。
+    systemctl restart ssh-rescue.service 2>/dev/null || true
+    sleep 2
+    if systemctl is-active --quiet ssh-rescue && port_listening "$RESCUE_PORT"; then
       ok "救援实例已启动并监听 :${RESCUE_PORT}"
     else
-      die "救援实例未起来（journalctl -u ssh-rescue），暂不修改主配置"
+      warn "救援实例未起来，最近日志："
+      journalctl -u ssh-rescue -n 20 --no-pager 2>/dev/null | sed 's/^/    /'
+      if ! port_listening "$RESCUE_PORT"; then
+        warn "端口 ${RESCUE_PORT} 当前没有监听者；若上面日志有 Address already in use，说明被别的程序占用"
+        ss -tlnHp 2>/dev/null | awk -v pat="[:.]${RESCUE_PORT}\$" '$4 ~ pat {print "    占用者: "$0}'
+      fi
+      die "可换端口重试：--rescue-port 2224。主 sshd 未被改动，现有连接不受影响"
     fi
   fi
 }

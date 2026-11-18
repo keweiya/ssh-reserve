@@ -11,7 +11,7 @@
 `ssh-reserve` 用 cgroup v2 给 sshd 做资源预留，再用 swap + earlyoom 兜底，让负载打满时依然**连得上、登得进**。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/keweiya/ssh-reserve/main/install.sh | sudo bash
+curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@main/install.sh | sudo bash
 ```
 
 默认创建 **2G swap**，其余自动按机器内存/核数调参。支持 `--dry-run` 先看再做。
@@ -70,13 +70,20 @@ CPU 排在最后：cgroup 权重足够解决，而且 sshd 本身几乎不吃 CP
 ### 一行（推荐）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/keweiya/ssh-reserve/main/install.sh | sudo bash
+curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@main/install.sh | sudo bash
 ```
+
+> `raw.githubusercontent.com` 在某些网络环境下会被边缘节点缓存较久（实测有拿到过几个前版本的），
+> jsDelivr 镜像刷新快得多。要完全可复现就用固定 tag 版本：
+>
+> ```bash
+> curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@v1.0.1/install.sh | sudo bash
+> ```
 
 ### 先看再做
 
 ```bash
-curl -fsSL -o install.sh https://raw.githubusercontent.com/keweiya/ssh-reserve/main/install.sh
+curl -fsSL -o install.sh https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@main/install.sh
 sudo bash install.sh --dry-run
 sudo bash install.sh
 ```
