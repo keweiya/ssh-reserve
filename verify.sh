@@ -84,23 +84,34 @@ b=bytearray(${MEM_MB}*1024*1024)
 for i in range(0,len(b),4096): b[i]=1
 time.sleep(${HOLD})"
 
-sleep 8
+sleep 3
 printf "  MemAvailable : %s MiB (%s%%)\n" "$(mem_avail)" "$(mem_pct)"
 printf "  load         : %s\n" "$(cut -d' ' -f1-3 /proc/loadavg)"
 
 echo
 echo "=================================================="
-echo " 负载下的 ssh 响应"
+echo " 负载下的 ssh 响应（earlyoom 介入之前）"
 echo "=================================================="
 for i in 1 2 3; do
-  printf "  #%d ssh :%-6s : %s ms\n" "$i" "$MAIN_PORT" "$(probe "$MAIN_PORT")"
+  # 探测与内存读数放在同一轮，便于看出压力在哪个点被 earlyoom 解除
+  latency=$(probe "$MAIN_PORT")
+  printf "  #%d ssh :%-6s : %s ms   MemAvailable %s MiB (%s%%)\n" \
+    "$i" "$MAIN_PORT" "$latency" "$(mem_avail)" "$(mem_pct)"
   sleep 1
 done
 if [[ -n $RESCUE_PORT ]]; then
   for i in 1 2; do
-    printf "  #%d ssh :%-6s : %s ms\n" "$i" "$RESCUE_PORT" "$(probe "$RESCUE_PORT")"
+    latency=$(probe "$RESCUE_PORT")
+    printf "  #%d ssh :%-6s : %s ms   MemAvailable %s MiB (%s%%)\n" \
+      "$i" "$RESCUE_PORT" "$latency" "$(mem_avail)" "$(mem_pct)"
     sleep 1
   done
+fi
+
+if systemctl is-active --quiet sr-mem 2>/dev/null; then
+  echo "  (压测进程仍在，内存压力持续)"
+else
+  echo "  (压测进程已被 earlyoom 回收 —— 这本身就是预期行为：它杀了压测而不是 sshd)"
 fi
 
 echo
