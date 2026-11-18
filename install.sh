@@ -28,6 +28,12 @@ set -Eeuo pipefail
 
 VERSION="1.0.0"
 
+# 管道安装（curl | bash）时本地没有脚本文件，安装结束后要把它们落到这里，
+# 并提供 ssh-reserve 管理命令，否则提示里的 verify.sh / uninstall.sh 跑不通。
+RAW_BASE="https://raw.githubusercontent.com/keweiya/ssh-reserve/main"
+SSH_RESERVE_LIB=${SSH_RESERVE_LIB:-/usr/local/lib/ssh-reserve}
+SWAP_PRI=10
+
 # ----------------------------------------------------------------------------
 # 默认参数
 # ----------------------------------------------------------------------------
@@ -176,6 +182,12 @@ stage_preflight() {
   BACKUP_DIR="/var/backups/ssh-reserve/$(date +%Y%m%d-%H%M%S)"
   if (( DRY_RUN )); then BACKUP_DIR="/tmp/ssh-reserve-dryrun"; fi
   ok "备份目录: $BACKUP_DIR"
+
+  # 判断是不是在用管道跑：BASH_SOURCE 为 bash 或 /dev/fd/63 这类不可读路径
+  SELF_PATH="${BASH_SOURCE[0]:-}"
+  if [[ -z $SELF_PATH || ! -f $SELF_PATH ]]; then
+    ok "检测到管道执行，安装后会把脚本落到 $SSH_RESERVE_LIB"
+  fi
 }
 
 backup_file() {
@@ -295,11 +307,15 @@ fstab_has_swap() {
 add_fstab_swap() {
   backup_file /etc/fstab
   if (( DRY_RUN )); then
-    printf '%s    $ echo "%s none swap sw 0 0" >> /etc/fstab%s\n' "$C_D" "$SWAP_FILE" "$C_0"
+    printf '%s    $ echo "%s none swap sw,pri=%s 0 0" >> /etc/fstab%s\n' \
+      "$C_D" "$SWAP_FILE" "$SWAP_PRI" "$C_0"
     return 0
   fi
-  printf '\n# ssh-reserve: persistent swap\n%s none swap sw 0 0\n' "$SWAP_FILE" >>/etc/fstab
-  ok "已写入 /etc/fstab"
+  # 显式写 pri：不写的话内核会从 -1 开始递减自动分配，
+  # swapon --show 里看起来像负数优先级，行为不可预期。
+  printf '\n# ssh-reserve: persistent swap\n%s none swap sw,pri=%s 0 0\n' \
+    "$SWAP_FILE" "$SWAP_PRI" >>/etc/fstab
+  ok "已写入 /etc/fstab（pri=${SWAP_PRI}）"
 }
 
 stage_swap() {
@@ -363,11 +379,13 @@ stage_swap() {
 
   if (( DRY_RUN )); then
     printf '%s    $ fallocate -l %sM %s   # 失败自动回退 dd%s\n' "$C_D" "$want_mb" "$SWAP_FILE" "$C_0"
-    printf '%s    $ chmod 600 %s && mkswap %s && swapon %s%s\n' "$C_D" "$SWAP_FILE" "$SWAP_FILE" "$SWAP_FILE" "$C_0"
+    printf '%s    $ chmod 600 %s && mkswap %s && swapon -p %s %s%s\n' \
+      "$C_D" "$SWAP_FILE" "$SWAP_FILE" "$SWAP_PRI" "$SWAP_FILE" "$C_0"
     if fstab_has_swap "$SWAP_FILE"; then
       ok "/etc/fstab 已有条目，无需追加"
     else
-      printf '%s    $ echo "%s none swap sw 0 0" >> /etc/fstab%s\n' "$C_D" "$SWAP_FILE" "$C_0"
+      printf '%s    $ echo "%s none swap sw,pri=%s 0 0" >> /etc/fstab%s\n' \
+        "$C_D" "$SWAP_FILE" "$SWAP_PRI" "$C_0"
     fi
     return 0
   fi
@@ -403,7 +421,7 @@ stage_swap() {
     chmod 600 "$SWAP_FILE"
     mkswap "$SWAP_FILE" >/dev/null
   fi
-  if ! swapon "$SWAP_FILE" 2>/dev/null; then
+  if ! swapon -p "$SWAP_PRI" "$SWAP_FILE" 2>/dev/null; then
     die "swapon 失败，检查 dmesg | tail"
   fi
 
@@ -850,7 +868,80 @@ stage_firewall() {
 }
 
 # ----------------------------------------------------------------------------
-# 11. 结果
+# 11. 把管理脚本落到本地（管道安装时尤其需要）
+# ----------------------------------------------------------------------------
+stage_persist() {
+  step "把管理脚本留在本地"
+  if (( DRY_RUN )); then
+    printf '%s    [dry-run] %s/{install,uninstall,verify}.sh + /usr/local/bin/ssh-reserve%s\n' \
+      "$C_D" "$SSH_RESERVE_LIB" "$C_0"
+    return 0
+  fi
+
+  mkdir -p "$SSH_RESERVE_LIB"
+  local f src local_dir missing=0
+  local_dir=""
+  if [[ -n ${SELF_PATH:-} && -f ${SELF_PATH:-} ]]; then
+    local_dir=$(cd -- "$(dirname -- "$SELF_PATH")" 2>/dev/null && pwd || true)
+  fi
+
+  for f in install.sh uninstall.sh verify.sh; do
+    src=""
+    if [[ -n $local_dir && -f $local_dir/$f ]]; then
+      src=$local_dir/$f
+    fi
+    if [[ -n $src ]]; then
+      cp -f "$src" "$SSH_RESERVE_LIB/$f"
+    elif command -v curl >/dev/null 2>&1; then
+      if curl -fsSL "$RAW_BASE/$f" -o "$SSH_RESERVE_LIB/$f"; then :; else missing=1; fi
+    else
+      missing=1
+    fi
+    if [[ -f $SSH_RESERVE_LIB/$f ]]; then chmod +x "$SSH_RESERVE_LIB/$f"; fi
+  done
+
+  if (( missing )); then
+    warn "部分脚本下载失败（网络？），已装好的配置不受影响"
+  fi
+
+  cat > /usr/local/bin/ssh-reserve <<'WRAPEOF'
+#!/usr/bin/env bash
+# ssh-reserve 管理入口
+set -euo pipefail
+D=${SSH_RESERVE_LIB:-/usr/local/lib/ssh-reserve}
+cmd=${1:-help}
+[[ $# -gt 0 ]] && shift || true
+case $cmd in
+  install)   exec bash "$D/install.sh" "$@" ;;
+  uninstall) exec bash "$D/uninstall.sh" "$@" ;;
+  verify)    exec bash "$D/verify.sh" "$@" ;;
+  status)
+    for u in ssh ssh-rescue earlyoom; do
+      printf '  %-12s %s\n' "$u" "$(systemctl is-active "$u" 2>/dev/null || echo n/a)"
+    done
+    swapon --show 2>/dev/null || true
+    ;;
+  help|-h|--help|*)
+    cat <<'H'
+ssh-reserve <command>
+
+  install [--swap-size 2G] [--dry-run ...]   部署 / 重新应用配置
+  uninstall [--remove-swap]                   卸载（默认保留 swap）
+  verify                                      压测复验：负载下 ssh 还能不能连
+  status                                      当前状态
+
+脚本目录: /usr/local/lib/ssh-reserve
+H
+    ;;
+esac
+WRAPEOF
+  chmod +x /usr/local/bin/ssh-reserve
+  ok "脚本已落到 $SSH_RESERVE_LIB"
+  ok "管理命令: ssh-reserve {install|uninstall|verify|status}"
+}
+
+# ----------------------------------------------------------------------------
+# 12. 结果
 # ----------------------------------------------------------------------------
 stage_report() {
   step "结果"
@@ -886,8 +977,9 @@ stage_report() {
 
   printf '\n'
   log "备份在 $BACKUP_DIR"
-  log "改坏了：bash uninstall.sh"
-  log "压测复验：bash verify.sh"
+  log "改坏了：ssh-reserve uninstall"
+  log "压测复验：ssh-reserve verify"
+  log "当前状态：ssh-reserve status"
 }
 
 # ----------------------------------------------------------------------------
@@ -906,6 +998,7 @@ main() {
   stage_journald
   stage_earlyoom
   stage_firewall
+  stage_persist
   stage_report
   printf '\n%s完成。%s\n' "$C_G" "$C_0"
 }
