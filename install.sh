@@ -26,7 +26,7 @@
 # =============================================================================
 set -Eeuo pipefail
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 
 # 管道安装（curl | bash）时本地没有脚本文件，安装结束后要把它们落到这里，
 # 并提供 ssh-reserve 管理命令，否则提示里的 verify.sh / uninstall.sh 跑不通。
@@ -251,6 +251,17 @@ derive_params() {
   USER_CPU_QUOTA=$(( NPROC * 75 ))
   if (( USER_CPU_QUOTA < 50 )); then USER_CPU_QUOTA=50; fi
 
+  # journald 限额：按磁盘容量算，小硬盘不能被日志吃掉一大块
+  # 规则 min(200M, max(32M, 磁盘 3%))：1G 盘 → 32M，59G 盘 → 200M
+  local disk_mb
+  disk_mb=$(df -Pm /var/log 2>/dev/null | awk 'NR==2{print $2}')
+  if [[ -z ${disk_mb:-} ]] || (( disk_mb < 64 )); then disk_mb=1024; fi
+  JOURNAL_MB=$(( disk_mb * 3 / 100 ))
+  if (( JOURNAL_MB < 32 ));  then JOURNAL_MB=32;  fi
+  if (( JOURNAL_MB > 200 )); then JOURNAL_MB=200; fi
+  JOURNAL_RUNTIME_MB=$(( JOURNAL_MB / 3 ))
+  if (( JOURNAL_RUNTIME_MB < 16 )); then JOURNAL_RUNTIME_MB=16; fi
+
   # 内核
   MIN_FREE_KB=$(( MEM_MB * 5 * 1024 / 100 ))
   if (( MIN_FREE_KB < 32768 ));  then MIN_FREE_KB=32768;  fi
@@ -273,6 +284,8 @@ derive_params() {
     "$SYSTEM_MEM_MIN" "$USER_MEM_HIGH" "$USER_MEM_MAX" "$USER_CPU_QUOTA" "$C_0"
   printf '%s    earlyoom  : mem<=5%% 时介入  ·  MaxStartups %s%s\n' "$C_D" \
     "$MAX_STARTUPS" "$C_0"
+  printf '%s    journald  : 上限 %sM（磁盘 %sM）%s\n' "$C_D" \
+    "$JOURNAL_MB" "$disk_mb" "$C_0"
 }
 
 # ----------------------------------------------------------------------------
@@ -760,11 +773,11 @@ stage_journald() {
 # 由 ssh-reserve ${VERSION} 生成
 # 被爆破时 sshd 会狂写失败记录：吃内存、抖动磁盘、写满磁盘导致登录写不了 wtmp
 [Journal]
-SystemMaxUse=200M
-SystemMaxFileSize=32M
+SystemMaxUse=${JOURNAL_MB}M
+SystemMaxFileSize=$(( JOURNAL_MB / 6 ))M
 SystemMaxFiles=10
-RuntimeMaxUse=64M
-RuntimeMaxFileSize=16M
+RuntimeMaxUse=${JOURNAL_RUNTIME_MB}M
+RuntimeMaxFileSize=$(( JOURNAL_RUNTIME_MB / 4 ))M
 RateLimitIntervalSec=30s
 RateLimitBurst=5000
 SyncIntervalSec=1m
