@@ -30,7 +30,7 @@
 # =============================================================================
 set -Eeuo pipefail
 
-VERSION="1.5.0"
+VERSION="1.5.1"
 
 # 管道安装（curl | bash）时本地没有脚本文件，安装结束后要把它们落到这里，
 # 并提供 ssh-reserve 管理命令，否则提示里的 verify.sh / uninstall.sh 跑不通。
@@ -1138,12 +1138,15 @@ EOF
   # 看门狗要 daemon-reexec 才会被 systemd 接管（不是 restart，PID 1 不变）
   systemctl daemon-reexec 2>/dev/null || warn "daemon-reexec 失败，重启后生效"
   sleep 2
-  local val
-  val=$(systemctl show -p RuntimeWatchdogUSec --value 2>/dev/null || echo 0)
-  if [[ $val != 0 && $val != "" ]]; then
-    ok "看门狗已接管，超时 $(( val / 1000000 ))s"
+  # 注意：systemctl show 对时间属性返回 "30min" 这类人类可读字符串，
+  # 直接拿去做算术会报 "value too great for base"。用 sysfs 的原始秒数。
+  local wd_state wd_timeout
+  wd_state=$(cat /sys/class/watchdog/watchdog0/state 2>/dev/null || echo unknown)
+  wd_timeout=$(cat /sys/class/watchdog/watchdog0/timeout 2>/dev/null || echo 0)
+  if [[ $wd_state == active && $wd_timeout =~ ^[0-9]+$ ]]; then
+    ok "看门狗已接管：${wd_timeout}s 超时，state=${wd_state}"
   else
-    warn "看门狗未接管，重启后生效"
+    warn "看门狗未接管（state=${wd_state}），重启后生效"
   fi
   warn "边界：只救 userspace 卡死。内核彻底死锁时 softdog 自己也不会触发"
 }
