@@ -19,14 +19,18 @@
 #    bash install.sh --uninstall         # 卸载（同 uninstall.sh）
 #    bash install.sh --help
 #
-#  一行安装：
+#  一行安装（无参数）：
 #    curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@main/install.sh | sudo bash
+#
+#  带参数时必须先下载再执行，或加 -s --，否则参数会被 bash 自己吃掉：
+#    curl -fsSL .../install.sh -o /tmp/ir.sh && sudo bash /tmp/ir.sh --with-watchdog
+#    curl -fsSL .../install.sh | sudo bash -s -- --with-watchdog
 #
 #  版本: 1.0.0    许可: MIT
 # =============================================================================
 set -Eeuo pipefail
 
-VERSION="1.4.2"
+VERSION="1.4.3"
 
 # 管道安装（curl | bash）时本地没有脚本文件，安装结束后要把它们落到这里，
 # 并提供 ssh-reserve 管理命令，否则提示里的 verify.sh / uninstall.sh 跑不通。
@@ -111,6 +115,10 @@ ssh-reserve — 小服务器 SSH 资源预留 + swap 一键部署
   --clean-legacy      只清理旧版保活方案的残留，不做其它改动
   --uninstall         卸载
   -h, --help          显示帮助
+
+注意：
+  管道运行时带参数要写成  ... | sudo bash -s -- <参数>
+  直接写  ... | sudo bash <参数>  时，参数会被 bash 自己解析掉。
 
 示例：
   bash install.sh                       # 2G swap + 全套

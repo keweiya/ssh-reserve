@@ -80,8 +80,27 @@ curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@main/install.sh | sud
 > jsDelivr 镜像刷新快得多。要完全可复现就用固定 tag 版本：
 >
 > ```bash
-> curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@v1.0.1/install.sh | sudo bash
+> curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@v1.4.3/install.sh | sudo bash
 > ```
+
+### 带参数时注意写法
+
+管道运行 `bash` 时，`--with-watchdog` 这类参数会被 **bash 自己**吃掉，
+不会传给脚本：
+
+```bash
+# ✗ 错误：bash 报 "--with-watchdog: invalid option"
+curl -fsSL ... | sudo bash --with-watchdog
+
+# ✓ 正确一：先下载再执行（推荐，参数一目了然）
+curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@v1.4.3/install.sh -o /tmp/ssh-reserve.sh
+sudo bash /tmp/ssh-reserve.sh --with-watchdog
+
+# ✓ 正确二：管道加 -s --
+curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@v1.4.3/install.sh | sudo bash -s -- --with-watchdog
+```
+
+只有**不带任何参数**时才能直接 `| sudo bash`。
 
 ### 先看再做
 
@@ -236,7 +255,8 @@ sudo bash uninstall.sh --keep-earlyoom  # 保留 earlyoom
 建议先清理再装。一条命令：
 
 ```bash
-curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@v1.3.0/install.sh | sudo bash --clean-legacy
+curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@v1.4.3/install.sh -o /tmp/ssh-reserve.sh
+sudo bash /tmp/ssh-reserve.sh --clean-legacy
 ```
 
 `--clean-legacy` 只做清理，不改其它任何东西；清理前会备份到 `/var/backups/ssh-reserve/`。
@@ -322,7 +342,8 @@ ok 容器环境: lxc（swap 将默认跳过，cgroup 设置可能受宿主限制
 ### 手动关闭
 
 ```bash
-curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@v1.2.0/install.sh | sudo bash --no-swap
+curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@v1.4.3/install.sh -o /tmp/ssh-reserve.sh
+sudo bash /tmp/ssh-reserve.sh --no-swap
 ```
 
 `--no-swap` 只表示"本次不创建/修改 swap"，**不会**删除已有的 swap 文件或 `/etc/fstab` 条目。
