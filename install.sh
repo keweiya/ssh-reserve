@@ -30,7 +30,7 @@
 # =============================================================================
 set -Eeuo pipefail
 
-VERSION="1.5.2"
+VERSION="1.5.3"
 
 # 管道安装（curl | bash）时本地没有脚本文件，安装结束后要把它们落到这里，
 # 并提供 ssh-reserve 管理命令，否则提示里的 verify.sh / uninstall.sh 跑不通。
@@ -617,8 +617,9 @@ stage_legacy() {
     else
       rm -f /etc/modules-load.d/softdog.conf
       modprobe -r softdog 2>/dev/null || true
-      ok "已移除 softdog"
-      warn "  软件看门狗在内核真死锁时自己也停了，起不到兜底作用；systemd 一卡就误重启反而更糟"
+      ok "已移除旧方案的 softdog 配置"
+      warn "  旧方案用 60 秒超时：journald 阻塞、cgroup 回收卡顿都会被误判成死机"
+      warn "  本脚本后面会用 30 分钟超时重新启用，只在真卡死时才重启"
     fi
   fi
 
