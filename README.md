@@ -80,24 +80,24 @@ curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@main/install.sh | sud
 > jsDelivr 镜像刷新快得多。要完全可复现就用固定 tag 版本：
 >
 > ```bash
-> curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@v1.4.3/install.sh | sudo bash
+> curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@v1.5.0/install.sh | sudo bash
 > ```
 
 ### 带参数时注意写法
 
-管道运行 `bash` 时，`--with-watchdog` 这类参数会被 **bash 自己**吃掉，
+管道运行 `bash` 时，`--no-swap` 这类参数会被 **bash 自己**吃掉，
 不会传给脚本：
 
 ```bash
-# ✗ 错误：bash 报 "--with-watchdog: invalid option"
-curl -fsSL ... | sudo bash --with-watchdog
+# ✗ 错误：bash 报 "--no-swap: invalid option"
+curl -fsSL ... | sudo bash --no-swap
 
 # ✓ 正确一：先下载再执行（推荐，参数一目了然）
-curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@v1.4.3/install.sh -o /tmp/ssh-reserve.sh
-sudo bash /tmp/ssh-reserve.sh --with-watchdog
+curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@v1.5.0/install.sh -o /tmp/ssh-reserve.sh
+sudo bash /tmp/ssh-reserve.sh --no-swap
 
 # ✓ 正确二：管道加 -s --
-curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@v1.4.3/install.sh | sudo bash -s -- --with-watchdog
+curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@v1.5.0/install.sh | sudo bash -s -- --no-swap
 ```
 
 只有**不带任何参数**时才能直接 `| sudo bash`。
@@ -125,9 +125,12 @@ sudo bash install.sh --no-swap          # 完全不动 swap
 | `--swap-size SIZE` | swap 大小，默认 `auto` = `clamp(内存, 2G, 4G)`；也可显式 `512M` / `2G` / `4G` / `1T` |
 | `--swap-file PATH` | swap 文件位置，默认 `/swapfile` |
 | `--no-swap` | 不创建/修改 swap |
+| `--system-floor SIZE` | `system.slice` 的保底内存，默认 `96M`（实测可压到 `64M`） |
+| `--with-slice` | 额外设置 `user.slice` 硬上限和 `heavy.slice` 隔离区 |
+| `--no-watchdog` | 关闭看门狗（默认启用，30 分钟超时） |
 | `--no-earlyoom` | 不安装 earlyoom |
-| `--no-slice` | 不设置 slice 层 CPU/内存上限 |
 | `--no-kernel` | 不改内核参数 |
+| `--clean-legacy` | 只清理旧版保活方案残留，不做其它改动 |
 | `--force` | 覆盖非 swap 的已存在文件 |
 | `--dry-run` | 只打印，不落盘 |
 | `--uninstall` | 卸载 |
@@ -255,7 +258,7 @@ sudo bash uninstall.sh --keep-earlyoom  # 保留 earlyoom
 建议先清理再装。一条命令：
 
 ```bash
-curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@v1.4.3/install.sh -o /tmp/ssh-reserve.sh
+curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@v1.5.0/install.sh -o /tmp/ssh-reserve.sh
 sudo bash /tmp/ssh-reserve.sh --clean-legacy
 ```
 
@@ -286,17 +289,33 @@ sudo bash /tmp/ssh-reserve.sh --clean-legacy
 | `OOMScoreAdjust=-1000` / `CPUWeight=1000` / `MemoryMin=32M` | 由 drop-in 接管，调整为 10000 / 96M |
 | `/etc/sysctl.conf` 的 `vm.swappiness=10` | 注释掉，改用 `/etc/sysctl.d/99-ssh-reserve.conf` 的 20 |
 | `kernel.panic=60` | 注释掉，避免和无意义的重启耦合 |
-| `softdog` + `RuntimeWatchdogSec=60s` | 移除（理由见下） |
+| `softdog` + `RuntimeWatchdogSec=60s` | 换成 **30 分钟**超时（理由见下） |
 | `ShutdownWatchdogSec=10min` | **保留**，关机卡住时硬重启是有用的 |
 | `EARLYOOM_ARGS="-m 4 -s 5"` | 覆盖为 `-m 5,2 -s 100,100` |
 | fstab 缺 `pri=`（显示成负数 PRIO） | 自动补成 `sw,pri=10` |
 
-### 为什么 softdog 起不到兜底作用
+### 为什么是 30 分钟，而不是 60 秒
 
-软件看门狗靠内核定时器喂狗。**内核真死锁时，定时器本身也停了**，狗不会叫；
-反过来，systemd 因为 journald 阻塞、cgroup 操作卡顿之类的软故障超过 60 秒，
-它又会**误判成死机直接重启整机**。对"低价 VPS、重启一次要很久"的场景，
-这是负收益。真正的硬兜底是云控制台的强制重启，不是 softdog。
+同样是 softdog，超时设成 60 秒和 30 分钟是完全不同的两件事：
+
+| 场景 | 60 秒超时 | 30 分钟超时（本脚本） |
+|---|---|---|
+| journald 写盘阻塞 90 秒 | **误重启** | 无影响 |
+| cgroup 内存回收卡顿 70 秒 | **误重启** | 无影响 |
+| 大文件 fsync 卡住 2 分钟 | **误重启** | 无影响 |
+| systemd 真的卡死 | 1 分钟后重启 | 30 分钟后重启 |
+
+60 秒在低价 VPS 上等于"随机重启"；30 分钟只在"真的死了"时才动手 ——
+如果你 SSH 进去等半小时什么都执行不了，那它确实已经废了。
+
+**softdog 的边界仍然存在**：它靠内核定时器喂狗，内核彻底死锁时定时器也停了，
+狗不会叫。它能救的是 systemd / dbus 卡死这类 userspace 故障 —— 那正是
+"登不上后台、命令全不响应"时最需要的一次自动重启。真正能救内核死锁的是
+硬件看门狗（i6300esb / IPMI），KVM 云主机通常不提供。
+
+**开销**：`softdog` + `watchdog` 两个内核模块共 **60 KiB**（占 1.9G 机器的
+0.003%），100% 由内核空间占用，不可回收也不可 swap；喂狗是每 15 分钟一次
+`write(2)`，CPU 开销微秒级。
 
 ### 为什么 `/etc/sysctl.conf` 必须清理
 
@@ -342,7 +361,7 @@ ok 容器环境: lxc（swap 将默认跳过，cgroup 设置可能受宿主限制
 ### 手动关闭
 
 ```bash
-curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@v1.4.3/install.sh -o /tmp/ssh-reserve.sh
+curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@v1.5.0/install.sh -o /tmp/ssh-reserve.sh
 sudo bash /tmp/ssh-reserve.sh --no-swap
 ```
 

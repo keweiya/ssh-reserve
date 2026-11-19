@@ -30,7 +30,7 @@
 # =============================================================================
 set -Eeuo pipefail
 
-VERSION="1.4.3"
+VERSION="1.5.0"
 
 # 管道安装（curl | bash）时本地没有脚本文件，安装结束后要把它们落到这里，
 # 并提供 ssh-reserve 管理命令，否则提示里的 verify.sh / uninstall.sh 跑不通。
@@ -50,7 +50,7 @@ DO_SWAP=1
 DO_EARLYOOM=1
 DO_KERNEL=1
 DO_SLICE=0              # 默认不设 user.slice/heavy 限制；--with-slice 开启
-DO_WATCHDOG=0           # 可选：userspace 卡死时自动重启
+DO_WATCHDOG=1           # 默认启用：userspace 卡死时自动重启；--no-watchdog 关闭
 SYSTEM_FLOOR=""         # system.slice 的 MemoryMin 覆盖值，空 = 96M
 DRY_RUN=0
 FORCE=0
@@ -107,7 +107,7 @@ ssh-reserve — 小服务器 SSH 资源预留 + swap 一键部署
   --no-earlyoom       不安装 earlyoom
   --no-slice          不设置 user.slice / heavy.slice（默认行为）
   --with-slice        额外设置 user.slice 硬上限和 heavy.slice 隔离区
-  --with-watchdog     启用 5 分钟看门狗（systemd 卡死时自动重启整机）
+  --no-watchdog       不启用看门狗（默认启用：30 分钟超时）
   --system-floor SIZE system.slice 的保底，默认 96M（可压到 64M）
   --no-kernel         不改内核参数
   --force             覆盖（非 swap 的）已存在文件
@@ -142,7 +142,8 @@ while [[ $# -gt 0 ]]; do
     --no-earlyoom)   DO_EARLYOOM=0; shift ;;
     --no-slice)      DO_SLICE=0; shift ;;
     --with-slice)    DO_SLICE=1; shift ;;
-    --with-watchdog) DO_WATCHDOG=1; shift ;;
+    --with-watchdog) DO_WATCHDOG=1; shift ;;   # 默认已开，保留兼容
+    --no-watchdog)   DO_WATCHDOG=0; shift ;;
     --system-floor)  SYSTEM_FLOOR=${2:?--system-floor 需要参数}; shift 2 ;;
     --system-floor=*) SYSTEM_FLOOR=${1#*=}; shift ;;
     --no-kernel)     DO_KERNEL=0; shift ;;
@@ -1097,10 +1098,11 @@ WRAPEOF
 # ----------------------------------------------------------------------------
 # 11.5 可选：看门狗（userspace 卡死时自动重启）
 #
-#   为什么默认关：60 秒级的看门狗会把"journald 阻塞几秒""cgroup 操作卡顿"
-#   误判成死机，在低价 VPS 上等于随机重启。300 秒才是"真卡死"的量级。
-#   为什么仍提供：内核彻底死锁时它救不了，但 systemd / dbus 卡死这类
-#   userspace 故障它能救 —— 那正是登不上后台时最需要的一次自动重启。
+#   资源开销：内核模块常驻 60 KiB（0.003%），喂狗是一次 write(2)，
+#   CPU 开销微秒级 —— 比 systemd 自身的日常开销低几个数量级。
+#   超时取 30 分钟：正常操作几乎不可能连续 30 分钟喂不上狗，
+#   所以误重启概率极低；代价是真死机后要等半小时才恢复。
+#   边界：内核彻底死锁时 softdog 自己也不触发，只有硬件狗能救。
 # ----------------------------------------------------------------------------
 stage_watchdog() {
   if (( ! DO_WATCHDOG )); then return 0; fi
@@ -1124,9 +1126,10 @@ stage_watchdog() {
   mkdir -p /etc/systemd/system.conf.d
   put /etc/systemd/system.conf.d/50-watchdog.conf <<'EOF'
 [Manager]
-# 由 ssh-reserve 生成。systemd 超过 5 分钟喂不上狗才认为真卡死。
+# 由 ssh-reserve 生成。systemd 超过 30 分钟喂不上狗才认为真卡死。
 # 不要调到 60s：journald 阻塞、cgroup 操作卡顿都会误触发重启。
-RuntimeWatchdogSec=300s
+# 实测开销：softdog + watchdog 内核模块共 60 KiB，喂狗为一次 write(2)。
+RuntimeWatchdogSec=1800s
 # 关机卡住 10 分钟后硬重启
 ShutdownWatchdogSec=10min
 EOF
