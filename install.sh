@@ -26,7 +26,7 @@
 # =============================================================================
 set -Eeuo pipefail
 
-VERSION="1.3.1"
+VERSION="1.3.2"
 
 # 管道安装（curl | bash）时本地没有脚本文件，安装结束后要把它们落到这里，
 # 并提供 ssh-reserve 管理命令，否则提示里的 verify.sh / uninstall.sh 跑不通。
@@ -232,11 +232,14 @@ derive_params() {
     printf '%d' "$v"
   }
 
-  # sshd 实际只用 10M 左右，预留约 10 倍余量应对 preauth 风暴
-  SSHD_MEM_MIN=$(pct "$MEM_MB" 5 64 128)
-  SSHD_MEM_LOW=$(( SSHD_MEM_MIN * 5 / 3 ))
-  SSHD_MEM_HIGH=$(( SSHD_MEM_MIN * 16 / 3 ))
-  SSHD_MEM_MAX=$(( SSHD_MEM_MIN * 8 ))
+  # sshd 的实际用量与机器规模无关：主进程约 2M，每个未认证连接约 5M。
+  # MaxStartups 最多允许 20 个并发 preauth（最坏约 120M），但 memory.min
+  # 只需覆盖"常态 + 少量并发"，不需要覆盖极端峰值——极端情况靠 MemoryHigh 节流。
+  # 32M 下限 = 6 个并发 preauth 的余量，实际保护的就是 sshd 真实占用的那几 M。
+  SSHD_MEM_MIN=32
+  SSHD_MEM_LOW=64
+  SSHD_MEM_HIGH=256
+  SSHD_MEM_MAX=512
 
   # 父层：system.slice 的硬保留，让 sshd 的 memory.min 成为绝对保护
   SYSTEM_MEM_MIN=$(pct "$MEM_MB" 33 384 1536)
