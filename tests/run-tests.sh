@@ -111,7 +111,10 @@ run_case "--system-floor 96M"   --system-floor 96M
 run_case "--system-floor 256M"  --system-floor 256M
 run_case "--swap-size 4G"       --swap-size 4G
 run_case "--swap-size 512M"     --swap-size 512M
-run_case "--swap-file /tmp/x"   --swap-file /tmp/x
+# 用唯一路径，避免被上一次运行的残留污染
+TMP_SWAP=$(mktemp -u /tmp/ssh-reserve-test.XXXXXXXX)
+run_case "--swap-file 唯一路径" --swap-file "$TMP_SWAP"
+rm -f "$TMP_SWAP"
 run_case "--clean-legacy"       --clean-legacy
 run_case "组合参数"             --system-floor 64M --with-slice --no-swap --no-earlyoom
 
