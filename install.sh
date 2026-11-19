@@ -26,7 +26,7 @@
 # =============================================================================
 set -Eeuo pipefail
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 
 # 管道安装（curl | bash）时本地没有脚本文件，安装结束后要把它们落到这里，
 # 并提供 ssh-reserve 管理命令，否则提示里的 verify.sh / uninstall.sh 跑不通。
@@ -505,6 +505,8 @@ stage_swap() {
 
   if fstab_has_swap "$SWAP_FILE"; then
     ok "/etc/fstab 已有条目"
+    # 重建分支同样要补 pri：旧方案写的 "sw 0 0" 会让重启后优先级变成负数
+    ensure_fstab_pri "$SWAP_FILE"
   else
     add_fstab_swap
   fi
