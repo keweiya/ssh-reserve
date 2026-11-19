@@ -75,6 +75,17 @@ fi
 # 管道运行时带参数必须提示 -s --
 if grep -q '\-s --' "$INSTALL"; then pass "文档提示了管道传参写法"; else fail "缺少管道传参提示"; fi
 
+# VERSION 必须与最新 git tag 一致（漏改会导致 tag 里的版本号对不上）
+VER=$(grep -m1 '^VERSION=' "$INSTALL" | cut -d'"' -f2)
+TAG=$(git -C "$ROOT" describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')
+if [[ -z $TAG ]]; then
+  skip "无 tag，跳过版本一致性检查"
+elif [[ $VER == "$TAG" ]]; then
+  pass "VERSION 与最新 tag 一致 ($VER)"
+else
+  fail "VERSION($VER) 与最新 tag($TAG) 不一致" "发版前用 sed 同步 install.sh 的 VERSION"
+fi
+
 # 所有 cond && action 形式在 set -e 下的隐患（粗筛）
 if grep -qE '^\s*\(\( [^)]+ \)\) && ' "$INSTALL"; then
   fail "存在裸的 (( )) && 表达式" "set -e 下条件为假会中断"
