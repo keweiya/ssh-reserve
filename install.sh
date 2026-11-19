@@ -30,7 +30,7 @@
 # =============================================================================
 set -Eeuo pipefail
 
-VERSION="1.5.1"
+VERSION="1.5.2"
 
 # 管道安装（curl | bash）时本地没有脚本文件，安装结束后要把它们落到这里，
 # 并提供 ssh-reserve 管理命令，否则提示里的 verify.sh / uninstall.sh 跑不通。
@@ -776,9 +776,9 @@ stage_slice() {
     done
     if (( removed )); then
       if (( ! DRY_RUN )); then systemctl daemon-reload; fi
-      warn "已移除 user.slice / heavy.slice 限制（需要时加 --with-slice 恢复）"
+      ok "已移除 user.slice / heavy.slice 限制（需要时加 --with-slice 恢复）"
     else
-      warn "未启用 slice 层限制（默认）。需要时加 --with-slice"
+      ok "user.slice / heavy.slice 不设限制（默认；需要时加 --with-slice）"
     fi
     return 0
   fi
