@@ -26,7 +26,7 @@
 # =============================================================================
 set -Eeuo pipefail
 
-VERSION="1.4.1"
+VERSION="1.4.2"
 
 # 管道安装（curl | bash）时本地没有脚本文件，安装结束后要把它们落到这里，
 # 并提供 ssh-reserve 管理命令，否则提示里的 verify.sh / uninstall.sh 跑不通。
@@ -47,6 +47,7 @@ DO_EARLYOOM=1
 DO_KERNEL=1
 DO_SLICE=0              # 默认不设 user.slice/heavy 限制；--with-slice 开启
 DO_WATCHDOG=0           # 可选：userspace 卡死时自动重启
+SYSTEM_FLOOR=""         # system.slice 的 MemoryMin 覆盖值，空 = 96M
 DRY_RUN=0
 FORCE=0
 ACTION="install"
@@ -103,6 +104,7 @@ ssh-reserve — 小服务器 SSH 资源预留 + swap 一键部署
   --no-slice          不设置 user.slice / heavy.slice（默认行为）
   --with-slice        额外设置 user.slice 硬上限和 heavy.slice 隔离区
   --with-watchdog     启用 5 分钟看门狗（systemd 卡死时自动重启整机）
+  --system-floor SIZE system.slice 的保底，默认 96M（可压到 64M）
   --no-kernel         不改内核参数
   --force             覆盖（非 swap 的）已存在文件
   --dry-run           只打印不执行
@@ -133,6 +135,8 @@ while [[ $# -gt 0 ]]; do
     --no-slice)      DO_SLICE=0; shift ;;
     --with-slice)    DO_SLICE=1; shift ;;
     --with-watchdog) DO_WATCHDOG=1; shift ;;
+    --system-floor)  SYSTEM_FLOOR=${2:?--system-floor 需要参数}; shift 2 ;;
+    --system-floor=*) SYSTEM_FLOOR=${1#*=}; shift ;;
     --no-kernel)     DO_KERNEL=0; shift ;;
     --force)         FORCE=1; shift ;;
     --dry-run)       DRY_RUN=1; shift ;;
@@ -246,11 +250,21 @@ derive_params() {
   SSHD_MEM_HIGH=256
   SSHD_MEM_MAX=512
 
-  # 父层保底：只需要容纳 sshd + systemd + dbus + journald，
-  # 因为登录后要能执行 systemctl restart / kill，光有 sshd 活着不够。
-  # 固定 256M（约 6~13%），不再按内存比例给到 33%——那是保业务，不是保 ssh。
-  SYSTEM_MEM_MIN=256
-  SYSTEM_MEM_LOW=320
+  # 父层保底：只需要容纳 sshd + systemd + journald + logind + dbus。
+  # 实测这几个核心进程 RSS 合计约 44M：
+  #   systemd 11.4 + journald 16.6 + sshd 8.6 + logind 4.6 + dbus 2.5
+  # 压测验证：min 降到 64M 时 ssh 仍是 12ms、systemctl 仍是 6ms，
+  # 且 sshd 的 memory.events 全 0。默认给 96M（约 2.2 倍余量）。
+  if [[ -n ${SYSTEM_FLOOR:-} ]]; then
+    SYSTEM_MEM_MIN=$(swap_mb_from_size "$SYSTEM_FLOOR")
+    if (( SYSTEM_MEM_MIN < 64 )); then
+      warn "system-floor ${SYSTEM_FLOOR} 低于 64M，按 64M 处理"
+      SYSTEM_MEM_MIN=64
+    fi
+  else
+    SYSTEM_MEM_MIN=96
+  fi
+  SYSTEM_MEM_LOW=$(( SYSTEM_MEM_MIN * 4 / 3 ))
 
   # 普通登录会话天花板
   USER_MEM_HIGH=$(pct "$MEM_MB" 40 256 2048)
