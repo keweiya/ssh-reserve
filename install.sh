@@ -26,7 +26,7 @@
 # =============================================================================
 set -Eeuo pipefail
 
-VERSION="1.3.2"
+VERSION="1.4.0"
 
 # 管道安装（curl | bash）时本地没有脚本文件，安装结束后要把它们落到这里，
 # 并提供 ssh-reserve 管理命令，否则提示里的 verify.sh / uninstall.sh 跑不通。
@@ -45,7 +45,7 @@ SWAP_FILE="/swapfile"
 DO_SWAP=1
 DO_EARLYOOM=1
 DO_KERNEL=1
-DO_SLICE=1
+DO_SLICE=0              # 默认不设 user.slice/heavy 限制；--with-slice 开启
 DRY_RUN=0
 FORCE=0
 ACTION="install"
@@ -99,7 +99,8 @@ ssh-reserve — 小服务器 SSH 资源预留 + swap 一键部署
   --swap-file PATH    swap 文件位置，默认 /swapfile
   --no-swap           不创建/修改 swap
   --no-earlyoom       不安装 earlyoom
-  --no-slice          不设置 slice 层的 CPU/内存上限
+  --no-slice          不设置 user.slice / heavy.slice（默认行为）
+  --with-slice        额外设置 user.slice 硬上限和 heavy.slice 隔离区
   --no-kernel         不改内核参数
   --force             覆盖（非 swap 的）已存在文件
   --dry-run           只打印不执行
@@ -128,6 +129,7 @@ while [[ $# -gt 0 ]]; do
     --no-rescue)     shift ;;
     --no-earlyoom)   DO_EARLYOOM=0; shift ;;
     --no-slice)      DO_SLICE=0; shift ;;
+    --with-slice)    DO_SLICE=1; shift ;;
     --no-kernel)     DO_KERNEL=0; shift ;;
     --force)         FORCE=1; shift ;;
     --dry-run)       DRY_RUN=1; shift ;;
@@ -241,9 +243,11 @@ derive_params() {
   SSHD_MEM_HIGH=256
   SSHD_MEM_MAX=512
 
-  # 父层：system.slice 的硬保留，让 sshd 的 memory.min 成为绝对保护
-  SYSTEM_MEM_MIN=$(pct "$MEM_MB" 33 384 1536)
-  SYSTEM_MEM_LOW=$(( SYSTEM_MEM_MIN * 6 / 5 ))
+  # 父层保底：只需要容纳 sshd + systemd + dbus + journald，
+  # 因为登录后要能执行 systemctl restart / kill，光有 sshd 活着不够。
+  # 固定 256M（约 6~13%），不再按内存比例给到 33%——那是保业务，不是保 ssh。
+  SYSTEM_MEM_MIN=256
+  SYSTEM_MEM_LOW=320
 
   # 普通登录会话天花板
   USER_MEM_HIGH=$(pct "$MEM_MB" 40 256 2048)
@@ -286,8 +290,13 @@ derive_params() {
   ok "内存 ${MEM_MB}M / ${NPROC} 核"
   printf '%s    sshd      : min=%sM low=%sM high=%sM max=%sM swap=0%s\n' "$C_D" \
     "$SSHD_MEM_MIN" "$SSHD_MEM_LOW" "$SSHD_MEM_HIGH" "$SSHD_MEM_MAX" "$C_0"
-  printf '%s    slices    : system.min=%sM  user(high=%sM,max=%sM,cpu=%s%%)%s\n' "$C_D" \
-    "$SYSTEM_MEM_MIN" "$USER_MEM_HIGH" "$USER_MEM_MAX" "$USER_CPU_QUOTA" "$C_0"
+  if (( DO_SLICE )); then
+    printf '%s    保底      : system.min=%sM  user(high=%sM,max=%sM,cpu=%s%%)%s\n' "$C_D" \
+      "$SYSTEM_MEM_MIN" "$USER_MEM_HIGH" "$USER_MEM_MAX" "$USER_CPU_QUOTA" "$C_0"
+  else
+    printf '%s    保底      : system.min=%sM  ·  user.slice 不限（--with-slice 可收紧）%s\n' "$C_D" \
+      "$SYSTEM_MEM_MIN" "$C_0"
+  fi
   printf '%s    earlyoom  : mem<=5%% 时介入  ·  MaxStartups %s%s\n' "$C_D" \
     "$MAX_STARTUPS" "$C_0"
   printf '%s    journald  : 上限 %sM（磁盘 %sM）%s\n' "$C_D" \
@@ -676,7 +685,7 @@ StartLimitBurst=0
 # CPU：与重负载争抢时抢占优先权（默认 100）
 CPUWeight=10000
 # 轻微 nice 加成。不用 -20：登录后的 shell 会继承该值，过高会压制系统进程
-Nice=-10
+Nice=-5
 # IO：磁盘打满时 sshd 不卡在 D 状态读 passwd / 写 wtmp
 IOWeight=10000
 IOSchedulingClass=best-effort
@@ -707,11 +716,9 @@ EOF
 # ----------------------------------------------------------------------------
 # 3. slice 层
 # ----------------------------------------------------------------------------
-stage_slice() {
-  if (( ! DO_SLICE )); then warn "按要求跳过 slice 层（--no-slice）"; return 0; fi
-  if (( ! CG_V2 )); then warn "cgroup v1：跳过 slice 层限额"; return 0; fi
-
-  step "slice 层额度"
+stage_system_floor() {
+  if (( ! CG_V2 )); then return 0; fi
+  step "system.slice 保底（够 sshd + systemd + dbus 执行 systemctl）"
 
   backup_file /etc/systemd/system/system.slice.d/50-ssh-reserve.conf
   put /etc/systemd/system/system.slice.d/50-ssh-reserve.conf <<EOF
@@ -722,6 +729,36 @@ stage_slice() {
 MemoryMin=${SYSTEM_MEM_MIN}M
 MemoryLow=${SYSTEM_MEM_LOW}M
 EOF
+}
+
+stage_slice() {
+  if (( ! DO_SLICE )); then
+    # 之前装过的限制要撤掉，否则"精简"只是新装不写，旧规则还在生效
+    local removed=0 f
+    for f in /etc/systemd/system/user.slice.d/50-ssh-reserve.conf \
+             /etc/systemd/system/heavy.slice \
+             /usr/local/bin/heavy; do
+      if [[ -f $f ]]; then
+        backup_file "$f"
+        if (( DRY_RUN )); then
+          printf '%s    移除 %s%s\n' "$C_D" "$f" "$C_0"
+        else
+          rm -f "$f"
+        fi
+        removed=1
+      fi
+    done
+    if (( removed )); then
+      if (( ! DRY_RUN )); then systemctl daemon-reload; fi
+      warn "已移除 user.slice / heavy.slice 限制（需要时加 --with-slice 恢复）"
+    else
+      warn "未启用 slice 层限制（默认）。需要时加 --with-slice"
+    fi
+    return 0
+  fi
+  if (( ! CG_V2 )); then warn "cgroup v1：跳过 slice 层限额"; return 0; fi
+
+  step "user.slice / heavy.slice（可选）"
 
   backup_file /etc/systemd/system/user.slice.d/50-ssh-reserve.conf
   put /etc/systemd/system/user.slice.d/50-ssh-reserve.conf <<EOF
@@ -1104,6 +1141,7 @@ main() {
   stage_swap
   stage_migrate
   stage_ssh_cgroup
+  stage_system_floor
   stage_slice
   stage_sshd_harden
   stage_apply
