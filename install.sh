@@ -26,7 +26,7 @@
 # =============================================================================
 set -Eeuo pipefail
 
-VERSION="1.2.1"
+VERSION="1.3.0"
 
 # 管道安装（curl | bash）时本地没有脚本文件，安装结束后要把它们落到这里，
 # 并提供 ssh-reserve 管理命令，否则提示里的 verify.sh / uninstall.sh 跑不通。
@@ -40,6 +40,7 @@ SWAP_PRI=10
 SWAP_SIZE="auto"        # auto = clamp(RAM, 2G, 4G)；也可显式给 2G / 4G / 512M
 SWAP_EXPLICIT=0         # 用户是否显式指定过 --swap-size
 CONTAINER=""            # 容器类型，空 = 非容器
+LEGACY_SSH_RESTART=0    # 旧方案清理动过 ssh.service，需要用 restart 而非 reload
 SWAP_FILE="/swapfile"
 DO_SWAP=1
 DO_EARLYOOM=1
@@ -102,6 +103,7 @@ ssh-reserve — 小服务器 SSH 资源预留 + swap 一键部署
   --no-kernel         不改内核参数
   --force             覆盖（非 swap 的）已存在文件
   --dry-run           只打印不执行
+  --clean-legacy      只清理旧版保活方案的残留，不做其它改动
   --uninstall         卸载
   -h, --help          显示帮助
 
@@ -130,6 +132,7 @@ while [[ $# -gt 0 ]]; do
     --force)         FORCE=1; shift ;;
     --dry-run)       DRY_RUN=1; shift ;;
     --uninstall)     ACTION="uninstall"; shift ;;
+    --clean-legacy)  ACTION="clean"; shift ;;
     -h|--help)       usage; exit 0 ;;
     *) die "未知参数: $1（--help 看用法）" ;;
   esac
@@ -342,6 +345,25 @@ fstab_has_swap() {
   awk -v f="$1" '!/^[[:space:]]*#/ && $1==f && $3=="swap"{found=1} END{exit !found}' /etc/fstab 2>/dev/null
 }
 
+# 旧方案常见遗留：fstab 里是 "sw 0 0"，没有 pri。
+# 不写 pri 时内核从 -1 开始自减分配，swapon --show 里会显示成负数优先级。
+ensure_fstab_pri() {
+  local f=$1
+  if ! awk -v f="$f" '$1==f && $3=="swap" && $4 !~ /pri=/{found=1} END{exit !found}' /etc/fstab 2>/dev/null; then
+    return 0
+  fi
+  backup_file /etc/fstab
+  if (( DRY_RUN )); then
+    printf '%s    /etc/fstab 的 swap 行补上 pri=%s%s\n' "$C_D" "$SWAP_PRI" "$C_0"
+    return 0
+  fi
+  awk -v f="$f" -v pri="$SWAP_PRI" 'BEGIN{OFS=" "}
+    $1==f && $3=="swap" && $4 !~ /pri=/ { print $1,$2,$3,$4",pri="pri,$5,$6; next }
+    { print }' /etc/fstab > /tmp/fstab.ssh-reserve.$$ \
+    && mv /tmp/fstab.ssh-reserve.$$ /etc/fstab
+  ok "/etc/fstab 补上 pri=${SWAP_PRI}"
+}
+
 add_fstab_swap() {
   backup_file /etc/fstab
   if (( DRY_RUN )); then
@@ -386,6 +408,7 @@ stage_swap() {
     ok "swap 已就绪: ${SWAP_FILE} = ${cur_mb}M（目标 ${want_mb}M，不动）"
     if fstab_has_swap "$SWAP_FILE"; then
       ok "/etc/fstab 已有条目，重启后仍在"
+      ensure_fstab_pri "$SWAP_FILE"
     else
       warn "$SWAP_FILE 未写入 /etc/fstab，重启后会丢失，正在补上"
       add_fstab_swap
@@ -492,6 +515,91 @@ stage_swap() {
     ok "swap 生效: ${now_mb}M"
   else
     warn "swap 可能未生效，检查 dmesg | tail"
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# 1.2 迁移：清理旧版"保活"方案留下的配置
+#
+#   常见来源是一套手工加固：直接改 /usr/lib/systemd/system/ssh.service、
+#   往 /etc/sysctl.conf 追加参数、装 softdog、开 RuntimeWatchdogSec。
+#   其中两处会帮倒忙，必须去掉。
+# ----------------------------------------------------------------------------
+stage_legacy() {
+  local touched=0 unit=/usr/lib/systemd/system/ssh.service f hits
+
+  # ① ssh.service 被直接改过
+  #    CPUSchedulingPolicy=rr + Priority=99 是最危险的一项：实时调度会饿死
+  #    所有普通进程，而且登录后的 shell 会继承它——在里面跑一条死循环就够整机卡死。
+  if [[ -f $unit ]]; then
+    hits=$(grep -cE '^(OOMScoreAdjust|CPUSchedulingPolicy|CPUSchedulingPriority|CPUWeight|MemoryMin)=' "$unit" 2>/dev/null) || true
+    hits=${hits:-0}
+    if (( hits > 0 )); then
+      touched=1
+      LEGACY_SSH_RESTART=1
+      backup_file "$unit"
+      if (( DRY_RUN )); then
+        printf '%s    从 %s 移除 %s 行手工追加的参数%s\n' "$C_D" "$unit" "$hits" "$C_0"
+      else
+        sed -i -E '/^(OOMScoreAdjust|CPUSchedulingPolicy|CPUSchedulingPriority|CPUWeight|MemoryMin)=/d' "$unit"
+        ok "ssh.service: 移除 $hits 行手工参数"
+        warn "  其中 CPUSchedulingPolicy=rr/99 是实时调度：会饿死普通进程，登录 shell 还会继承它"
+        warn "  原来手工的 OOMScoreAdjust/CPUWeight/MemoryMin 由本脚本的 drop-in 接管，值更合适"
+      fi
+    fi
+  fi
+
+  # ② /etc/sysctl.conf 追加项
+  #    sysctl --system 最后读 /etc/sysctl.conf，它的优先级最高，会覆盖 sysctl.d/
+  f=/etc/sysctl.conf
+  if [[ -f $f ]]; then
+    hits=$(grep -cE '^[[:space:]]*(vm\.swappiness|vm\.panic_on_oom|kernel\.panic)[[:space:]]*=' "$f" 2>/dev/null) || true
+    hits=${hits:-0}
+    if (( hits > 0 )); then
+      touched=1
+      backup_file "$f"
+      if (( DRY_RUN )); then
+        printf '%s    注释 %s 里 %s 行旧参数%s\n' "$C_D" "$f" "$hits" "$C_0"
+      else
+        sed -i -E 's/^([[:space:]]*(vm\.swappiness|vm\.panic_on_oom|kernel\.panic)[[:space:]]*=.*)$/# [ssh-reserve legacy] \1/' "$f"
+        ok "sysctl.conf: 注释 $hits 行旧参数（它优先级最高，会静默覆盖 sysctl.d）"
+        warn "  vm.panic_on_oom=1 已停用：OOM 时直接重启整机，和保住 SSH 的目标正好相反"
+      fi
+    fi
+  fi
+
+  # ③ softdog 软件看门狗
+  if [[ -f /etc/modules-load.d/softdog.conf ]]; then
+    touched=1
+    backup_file /etc/modules-load.d/softdog.conf
+    if (( DRY_RUN )); then
+      printf '%s    移除 softdog 开机加载%s\n' "$C_D" "$C_0"
+    else
+      rm -f /etc/modules-load.d/softdog.conf
+      modprobe -r softdog 2>/dev/null || true
+      ok "已移除 softdog"
+      warn "  软件看门狗在内核真死锁时自己也停了，起不到兜底作用；systemd 一卡就误重启反而更糟"
+    fi
+  fi
+
+  # ④ RuntimeWatchdogSec
+  f=/etc/systemd/system.conf
+  if [[ -f $f ]] && grep -qE '^[[:space:]]*RuntimeWatchdogSec=' "$f"; then
+    touched=1
+    backup_file "$f"
+    if (( DRY_RUN )); then
+      printf '%s    注释 %s 的 RuntimeWatchdogSec%s\n' "$C_D" "$f" "$C_0"
+    else
+      sed -i -E 's/^([[:space:]]*RuntimeWatchdogSec=.*)$/# [ssh-reserve legacy] \1/' "$f"
+      ok "system.conf: 停用 RuntimeWatchdogSec"
+      warn "  ShutdownWatchdogSec 保留——关机卡住时硬重启是有用的，运行期看门狗才是风险"
+    fi
+  fi
+
+  if (( touched )); then
+    if (( ! DRY_RUN )); then
+      sysctl --system >/dev/null 2>&1 || true
+    fi
   fi
 }
 
@@ -724,7 +832,15 @@ stage_apply() {
     return 0
   fi
   systemctl daemon-reload
-  # reload 走 SIGHUP，不断已建立连接
+  # 清理过 ssh.service 时必须 restart：调度策略是进程属性，reload 不会重置它。
+  # KillMode=process 只杀主进程，已建立的会话不受影响，所以不会踢掉自己。
+  if (( LEGACY_SSH_RESTART )); then
+    if systemctl restart ssh 2>/dev/null; then
+      ok "ssh 已 restart（让实时调度等旧参数真正失效）"
+      return 0
+    fi
+    warn "restart 失败，退回 reload"
+  fi
   if systemctl reload ssh 2>/dev/null; then
     ok "ssh 已 reload（零中断）"
   else
@@ -963,8 +1079,23 @@ stage_report() {
 main() {
   log "ssh-reserve ${VERSION}"
   if (( DRY_RUN )); then warn "DRY-RUN 模式：只打印，不落盘"; fi
+
+  if [[ $ACTION == clean ]]; then
+    stage_preflight
+    derive_params
+    stage_legacy
+    if (( ! DRY_RUN )); then
+      systemctl daemon-reload
+      systemctl restart ssh 2>/dev/null || warn "ssh 重启失败，稍后手动 systemctl restart ssh"
+      journalctl --flush >/dev/null 2>&1 || true
+    fi
+    printf '\n%s清理完成。%s\n' "$C_G" "$C_0"
+    return 0
+  fi
+
   stage_preflight
   derive_params
+  stage_legacy
   stage_swap
   stage_migrate
   stage_ssh_cgroup

@@ -230,6 +230,68 @@ sudo bash uninstall.sh --keep-earlyoom  # 保留 earlyoom
 
 ---
 
+## 从旧版"保活"方案迁移
+
+如果你之前手工做过一套 ssh 保活（直接改 `ssh.service`、往 `/etc/sysctl.conf` 加参数、装 `softdog`），
+建议先清理再装。一条命令：
+
+```bash
+curl -fsSL https://cdn.jsdelivr.net/gh/keweiya/ssh-reserve@v1.3.0/install.sh | sudo bash --clean-legacy
+```
+
+`--clean-legacy` 只做清理，不改其它任何东西；清理前会备份到 `/var/backups/ssh-reserve/`。
+
+### 旧方案里有两处会帮倒忙
+
+**① `CPUSchedulingPolicy=rr` + `CPUSchedulingPriority=99`**
+
+给 sshd 配实时调度，看着像"最高优先级"，实际是**整机卡死的捷径**：
+
+- `rr/99` 会饿死同 CPU 上的所有普通进程，包括 systemd、journald
+- 登录后的 shell 会**继承**这个策略，在里面跑一条死循环就够把机器弄死
+- 一旦生效，CFS 的 `CPUWeight` 完全失效（实时调度不走权重分配）
+
+**② `vm.panic_on_oom=1`**
+
+内存耗尽时直接 panic 重启整机，和"保住 SSH"的目标正好相反 —— 你想让 SSH 活着，
+结果 SSH 被重启带走，还要等 panic timeout。而且它让内核放弃了 OOM killer
+挑选受害进程的能力：哪怕只差几十 MB，也可能是整机重启而不是杀掉一个吃内存的进程。
+
+### 各项处理方式
+
+| 旧配置 | 处理 |
+|---|---|
+| `CPUSchedulingPolicy=rr` / `CPUSchedulingPriority=99` | **移除**，并用 `restart`（不是 `reload`）让它真正失效 |
+| `vm.panic_on_oom=1` | 注释掉，恢复默认 0 |
+| `OOMScoreAdjust=-1000` / `CPUWeight=1000` / `MemoryMin=32M` | 由 drop-in 接管，调整为 10000 / 96M |
+| `/etc/sysctl.conf` 的 `vm.swappiness=10` | 注释掉，改用 `/etc/sysctl.d/99-ssh-reserve.conf` 的 20 |
+| `kernel.panic=60` | 注释掉，避免和无意义的重启耦合 |
+| `softdog` + `RuntimeWatchdogSec=60s` | 移除（理由见下） |
+| `ShutdownWatchdogSec=10min` | **保留**，关机卡住时硬重启是有用的 |
+| `EARLYOOM_ARGS="-m 4 -s 5"` | 覆盖为 `-m 5,2 -s 100,100` |
+| fstab 缺 `pri=`（显示成负数 PRIO） | 自动补成 `sw,pri=10` |
+
+### 为什么 softdog 起不到兜底作用
+
+软件看门狗靠内核定时器喂狗。**内核真死锁时，定时器本身也停了**，狗不会叫；
+反过来，systemd 因为 journald 阻塞、cgroup 操作卡顿之类的软故障超过 60 秒，
+它又会**误判成死机直接重启整机**。对"低价 VPS、重启一次要很久"的场景，
+这是负收益。真正的硬兜底是云控制台的强制重启，不是 softdog。
+
+### 为什么 `/etc/sysctl.conf` 必须清理
+
+`sysctl --system` 的读取顺序是 `sysctl.d/*.conf` → `sysctl.conf` 在前，
+`/etc/sysctl.conf` **最后读**，后读的覆盖先读的。实测：
+
+```
+sysctl.d 里写 vm.swappiness = 20            → 生效 20
+再往 /etc/sysctl.conf 加 vm.swappiness=10   → 生效 10   ← 被静默覆盖
+```
+
+所以旧方案写在 `sysctl.conf` 的参数会盖掉新配置，必须处理，否则你以为装好了其实没生效。
+
+---
+
 ## 容器 / 小硬盘环境（LXC、Docker、K8s pod）
 
 这些环境里 swap 通常开不起来，原因不止一个：
